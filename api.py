@@ -1,0 +1,624 @@
+"""
+ShiftLeft Society — FastAPI Gateway v2.2
+SSE streaming via async job queues (POST /analyze/start → GET /analyze/stream/{run_id}).
+
+v2.2 fix:
+  - dialogue_history parser now extracts negotiation fields (position, budget_spent,
+    budget_remaining, gap_tiers, defend_cost) into a nego sub-object so the
+    Theatre replay budget widget renders correctly.
+"""
+
+import asyncio, hashlib, hmac, json, os, sqlite3, subprocess, sys, time, uuid
+from typing import Dict
+
+import requests, uvicorn
+from fastapi import FastAPI, HTTPException, Query, Request, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from pydantic import BaseModel
+
+import database as db
+from tribunal import tribunal_app
+from sarif_export import verdict_to_sarif
+
+app = FastAPI(title="ShiftLeft Society API", version="2.2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+GITHUB_TOKEN          = os.environ.get("GITHUB_TOKEN", "")
+DB_PATH               = "tribunal_history.db"
+
+active_jobs: Dict[str, asyncio.Queue] = {}
+mcp_process = None
+
+AGENT_DISPLAY = {
+    "security_auditor_r1":    "Security Auditor — Round 1",
+    "performance_analyst_r1": "Performance Analyst — Round 1",
+    "security_debates":       "Security Auditor — Negotiation",
+    "performance_debates":    "Performance Analyst — Negotiation",
+    "lead_mediator":          "Lead Mediator — Synthesis",
+}
+
+SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0, "INFO": 0, "SAFE": 0}
+NEGO_POSITIONS = {"DEFEND", "PARTIAL", "CONCEDE"}
+
+
+# =====================================================================
+# HELPERS
+# =====================================================================
+def _db_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _row_to_dict(row):
+    return {k: row[k] for k in row.keys()} if row else {}
+
+def _combined_severity(sec: str, perf: str) -> str:
+    sec = (sec or "NONE").upper()
+    perf = (perf or "NONE").upper()
+    return sec if SEVERITY_RANK.get(sec, 0) >= SEVERITY_RANK.get(perf, 0) else perf
+
+
+def _role_from_sender(sender: str) -> str:
+    s = (sender or "").lower()
+    if "lead mediator" in s or "mediator" in s:
+        return "mediator"
+    if "security" in s:
+        return "security"
+    if "performance" in s:
+        return "performance"
+    return "system"
+
+
+def _parse_dialogue_item(m: dict) -> dict:
+    """
+    Tribunal stores each dialogue message as:
+      {"sender": "Security Auditor", "round": 1,
+       "content": "<JSON-stringified agent report>", "timestamp": "..."}
+
+    Unpacks the inner JSON, builds a clean message dict for the UI, AND extracts
+    negotiation fields into a 'nego' sub-object so the budget widget can render.
+    """
+    sender = m.get("sender", m.get("agent", m.get("role", "unknown")))
+    round_num = m.get("round", 1)
+    timestamp = m.get("timestamp")
+    raw_content = m.get("content", m.get("message", ""))
+
+    role = _role_from_sender(sender)
+    severity = None
+    confidence = None
+    message_type = "finding"
+    display_parts = []
+    nego = None  # v2.2: extract negotiation data if present
+
+    parsed = None
+    if isinstance(raw_content, str) and raw_content.strip().startswith("{"):
+        try:
+            parsed = json.loads(raw_content)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if isinstance(parsed, dict):
+        role_inner = parsed.get("role", "")
+        if "mediator" in role_inner.lower() or parsed.get("verdict"):
+            role = "mediator"
+        elif "security" in role_inner.lower():
+            role = "security"
+        elif "performance" in role_inner.lower() or "perf" in role_inner.lower():
+            role = "performance"
+
+        severity = (parsed.get("severity") or parsed.get("revised_severity") or "")
+        if isinstance(severity, str):
+            severity = severity.upper() or None
+        confidence = parsed.get("confidence_score")
+
+        if parsed.get("verdict"):
+            message_type = "verdict"
+
+        # Extract negotiation data if this looks like a Round 2 message
+        position = parsed.get("position")
+        if position in NEGO_POSITIONS:
+            message_type = "negotiation"
+            nego = {
+                "position":          position,
+                "revised_severity":  parsed.get("revised_severity"),
+                "budget_spent":      parsed.get("budget_spent"),
+                "budget_remaining":  parsed.get("budget_remaining"),
+                "gap_tiers":         parsed.get("gap_tiers"),
+                "defend_cost":       parsed.get("defend_cost"),
+            }
+
+        if parsed.get("title"):
+            display_parts.append(parsed["title"])
+        if parsed.get("description"):
+            display_parts.append(parsed["description"])
+        if parsed.get("argument"):
+            display_parts.append(parsed["argument"])
+        # Don't append "Position: ..." text — the nego widget shows it visually
+        if not nego and parsed.get("position") and parsed.get("position") != "PARTIAL_AGREEMENT":
+            display_parts.append(f"Position: {parsed['position']}")
+        if parsed.get("conflict_resolution") and parsed["conflict_resolution"] != "No conflict detected.":
+            display_parts.append(parsed["conflict_resolution"])
+        if parsed.get("fix") and not parsed.get("description"):
+            display_parts.append("Fix: " + parsed["fix"])
+
+        content = "\n\n".join(p for p in display_parts if p).strip()
+        if not content:
+            content = raw_content
+    else:
+        content = raw_content
+
+    out = {
+        "agent_role": role,
+        "round": round_num,
+        "content": content,
+        "severity": severity,
+        "confidence": confidence,
+        "message_type": message_type,
+        "timestamp": timestamp,
+    }
+    if nego:
+        out["nego"] = nego
+    return out
+
+
+# =====================================================================
+# LIFECYCLE
+# =====================================================================
+@app.on_event("startup")
+async def startup():
+    global mcp_process
+    await db.init_db()
+    mcp_port = os.environ.get("MCP_PORT", "8001")
+    print(f"Starting MCP server on port {mcp_port}...")
+    mcp_process = subprocess.Popen(
+        [sys.executable, "mcp_server.py"],
+        env={**os.environ, "MCP_PORT": mcp_port},
+    )
+    await asyncio.sleep(3)
+    print("MCP server started.")
+
+@app.on_event("shutdown")
+async def shutdown():
+    if mcp_process:
+        mcp_process.terminate()
+
+
+# =====================================================================
+# HEALTH
+# =====================================================================
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "ShiftLeft Society", "version": "2.2"}
+
+@app.get("/alibaba-proof")
+async def alibaba_proof():
+    return {
+        "deployment": "Alibaba Cloud ECS",
+        "region":     os.environ.get("ALIBABA_CLOUD_REGION", "ap-southeast-1"),
+        "instance_id": os.environ.get("ECS_INSTANCE_ID", "i-shiftleft"),
+        "model":      "qwen-max",
+        "endpoint":   "dashscope-intl.aliyuncs.com",
+        "mcp_server": f"http://localhost:{os.environ.get('MCP_PORT', 8001)}/mcp",
+    }
+
+
+# =====================================================================
+# TRIBUNAL
+# =====================================================================
+class CodePayload(BaseModel):
+    code:              str
+    filename:          str = "auth_service.py"
+    issue_description: str = "Implement secure database connection."
+
+async def run_tribunal_task(run_id: str, payload: CodePayload, queue: asyncio.Queue):
+    start_time = time.time()
+
+    async def emit(event_type: str, data: dict):
+        await queue.put({"type": event_type, "run_id": run_id, **data})
+
+    state = {
+        "run_id":             run_id,
+        "code":               payload.code,
+        "filename":           payload.filename,
+        "issue_description":  payload.issue_description,
+        "round1_reports":     [],
+        "round2_responses":   [],
+        "dialogue_history":   [],
+        "security_r1":        {},
+        "performance_r1":     {},
+        "security_r2":        {},
+        "performance_r2":     {},
+        "security_severity":  "UNKNOWN",
+        "performance_severity": "UNKNOWN",
+        "conflict_detected":  False,
+        "final_verdict":      {},
+        "mcp_verified":       False,
+    }
+
+    final_result = None
+
+    try:
+        await emit("status", {"message": "Tribunal starting...", "agent": "system"})
+
+        async for event in tribunal_app.astream_events(state, version="v2"):
+            etype = event.get("event", "")
+            name  = event.get("name",  "")
+            data  = event.get("data",  {})
+
+            if etype == "on_chain_start" and name in AGENT_DISPLAY:
+                await emit("agent_start", {
+                    "agent": name,
+                    "label": AGENT_DISPLAY[name],
+                })
+
+            elif etype == "on_chain_end" and name in AGENT_DISPLAY:
+                await emit("agent_complete", {
+                    "agent":  name,
+                    "output": data.get("output", {}),
+                })
+
+            elif etype == "on_chain_end" and name == "LangGraph":
+                final_result = data.get("output", {})
+
+        if not final_result:
+            print("[API] Warning: final state not found in events — falling back to ainvoke.")
+            final_result = await tribunal_app.ainvoke(state)
+
+        duration = round(time.time() - start_time, 2)
+        fv = final_result.get("final_verdict", {})
+        dialogue = final_result.get("dialogue_history", [])
+
+        await db.store_analysis(
+            run_id=run_id,
+            filename=payload.filename,
+            issue_description=payload.issue_description,
+            code=payload.code,
+            security_severity=final_result.get("security_severity", "UNKNOWN"),
+            performance_severity=final_result.get("performance_severity", "UNKNOWN"),
+            conflict_detected=final_result.get("conflict_detected", False),
+            verdict=fv.get("verdict", "UNKNOWN"),
+            promise_verified=fv.get("promise_verified", False),
+            conflict_resolution=fv.get("conflict_resolution", ""),
+            remediation_code=fv.get("remediation_code", ""),
+            dialogue_history=dialogue,
+            sbom=fv.get("sbom"),
+            mcp_verified=final_result.get("mcp_verified", False),
+            duration_seconds=duration,
+        )
+
+        await emit("complete", {
+            "security":          final_result.get("security_r1", {}),
+            "performance":       final_result.get("performance_r1", {}),
+            "security_r2":       final_result.get("security_r2", {}),
+            "performance_r2":    final_result.get("performance_r2", {}),
+            "verdict":           fv,
+            "conflict_detected": final_result.get("conflict_detected", False),
+            "mcp_verified":      final_result.get("mcp_verified", False),
+            "dialogue_history":  dialogue,
+            "duration_seconds":  duration,
+        })
+
+    except Exception as e:
+        print(f"[Tribunal Error] run_id={run_id}: {e}")
+        await emit("error", {"message": str(e)})
+    finally:
+        await queue.put({"type": "_sentinel"})
+
+
+@app.post("/analyze/start")
+async def start_analysis(payload: CodePayload) -> dict:
+    run_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    active_jobs[run_id] = queue
+    asyncio.create_task(run_tribunal_task(run_id, payload, queue))
+    return {"run_id": run_id, "stream_url": f"/analyze/stream/{run_id}"}
+
+
+@app.get("/analyze/stream/{run_id}")
+async def stream_analysis(run_id: str):
+    queue = active_jobs.get(run_id)
+    if not queue:
+        raise HTTPException(404, f"Run {run_id} not found.")
+
+    async def generate():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=180)
+                except asyncio.TimeoutError:
+                    yield "data: {\"type\": \"timeout\"}\n\n"
+                    break
+                if event.get("type") == "_sentinel":
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") in ("complete", "error"):
+                    break
+        finally:
+            active_jobs.pop(run_id, None)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# =====================================================================
+# HISTORY & COMPLIANCE HUB
+# =====================================================================
+@app.get("/history")
+async def get_history(limit: int = 50):
+    return {"status": "ok", "analyses": await db.get_history(limit)}
+
+@app.get("/history/{run_id}")
+async def get_analysis_detail(run_id: str):
+    row = await db.get_analysis(run_id)
+    if not row:
+        raise HTTPException(404, "Analysis not found.")
+    return {"status": "ok", "analysis": row}
+
+@app.get("/history/{run_id}/sbom")
+async def download_sbom(run_id: str):
+    content = await db.get_sbom(run_id)
+    if not content:
+        raise HTTPException(404, "No SBOM — only APPROVE verdicts generate SBOMs.")
+    return JSONResponse(
+        content=json.loads(content),
+        headers={"Content-Disposition": f"attachment; filename=sbom_{run_id[:8]}.json"},
+    )
+
+@app.get("/stats")
+async def get_stats():
+    return {"status": "ok", "stats": await db.get_stats()}
+
+
+# =====================================================================
+# OPERATOR CONSOLE & THEATRE REPLAY
+# =====================================================================
+@app.get("/analyses")
+async def list_analyses(
+    limit: int = Query(50, ge=1, le=200),
+    verdict: str = Query(None, description="Filter: APPROVE, REJECT, REVIEW"),
+):
+    sql = """
+        SELECT run_id AS id,
+               timestamp AS created_at,
+               filename AS file_name,
+               issue_description,
+               verdict,
+               security_severity,
+               performance_severity,
+               conflict_detected,
+               promise_verified,
+               mcp_verified,
+               total_tokens,
+               cost_usd,
+               duration_seconds,
+               pr_number,
+               repo_name
+        FROM analyses
+    """
+    params = []
+    if verdict:
+        sql += " WHERE UPPER(verdict) = ?"
+        params.append(verdict.upper())
+    sql += " ORDER BY timestamp DESC LIMIT ?"
+    params.append(limit)
+
+    with _db_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    analyses = []
+    for r in rows:
+        d = _row_to_dict(r)
+        d["severity"] = _combined_severity(
+            d.get("security_severity"), d.get("performance_severity")
+        )
+        analyses.append(d)
+
+    return {"count": len(analyses), "analyses": analyses}
+
+
+@app.get("/analyses/{run_id}/replay")
+async def get_replay(run_id: str):
+    with _db_conn() as conn:
+        analysis = conn.execute(
+            """SELECT run_id AS id, timestamp AS created_at, filename AS file_name,
+                      issue_description, code_snippet, verdict, security_severity,
+                      performance_severity, conflict_detected, conflict_resolution,
+                      remediation_code, promise_verified, mcp_verified, sbom,
+                      dialogue_history, total_tokens, cost_usd, duration_seconds
+               FROM analyses WHERE run_id = ?""",
+            (run_id,),
+        ).fetchone()
+        if not analysis:
+            raise HTTPException(404, f"Analysis {run_id} not found")
+
+        rows = conn.execute("""
+            SELECT agent_role, round, content, severity, confidence,
+                   message_type, timestamp
+            FROM messages
+            WHERE analysis_id = ?
+            ORDER BY timestamp ASC, id ASC
+        """, (run_id,)).fetchall()
+
+    analysis_dict = _row_to_dict(analysis)
+    analysis_dict["severity"] = _combined_severity(
+        analysis_dict.get("security_severity"),
+        analysis_dict.get("performance_severity"),
+    )
+
+    messages = [_row_to_dict(m) for m in rows]
+
+    if not messages and analysis_dict.get("dialogue_history"):
+        try:
+            parsed = json.loads(analysis_dict["dialogue_history"])
+            if isinstance(parsed, list):
+                messages = [_parse_dialogue_item(item) for item in parsed if isinstance(item, dict)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    analysis_dict.pop("dialogue_history", None)
+
+    return {
+        "analysis": analysis_dict,
+        "messages": messages,
+        "message_count": len(messages),
+    }
+
+
+@app.get("/analyses/{run_id}/sarif")
+async def get_sarif(run_id: str):
+    with _db_conn() as conn:
+        row = conn.execute(
+            """SELECT verdict_json, code_snippet, filename, verdict,
+                      security_severity, performance_severity,
+                      issue_description, remediation_code
+               FROM analyses WHERE run_id = ?""",
+            (run_id,),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(404, f"Analysis {run_id} not found")
+
+    verdict_data = {}
+    if row["verdict_json"]:
+        try:
+            verdict_data = json.loads(row["verdict_json"])
+        except json.JSONDecodeError:
+            verdict_data = {}
+
+    if not verdict_data.get("findings"):
+        combined_sev = _combined_severity(
+            row["security_severity"], row["performance_severity"]
+        )
+        verdict_data = {
+            "verdict": row["verdict"] or "UNKNOWN",
+            "severity": combined_sev,
+            "findings": [
+                {
+                    "title": row["issue_description"] or "Tribunal finding",
+                    "description": row["issue_description"] or "",
+                    "severity": combined_sev,
+                    "category": "TribunalFinding",
+                    "line": 1,
+                    "remediation": row["remediation_code"] or "",
+                }
+            ] if row["issue_description"] else [],
+        }
+
+    file_name = row["filename"] or "analyzed_file.py"
+    sarif_doc = verdict_to_sarif(verdict_data, file_path=file_name)
+
+    return Response(
+        content=json.dumps(sarif_doc, indent=2),
+        media_type="application/sarif+json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="shiftleft-{run_id[:8]}.sarif"'
+            ),
+        },
+    )
+
+
+# =====================================================================
+# GITHUB WEBHOOK
+# =====================================================================
+def _verify_sig(body: bytes, sig: str) -> bool:
+    if not GITHUB_WEBHOOK_SECRET:
+        return True
+    expected = "sha256=" + hmac.new(GITHUB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig or "")
+
+def _post_pr_comment(repo: str, pr_num: int, body: str):
+    if not GITHUB_TOKEN:
+        return
+    requests.post(
+        f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments",
+        headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"},
+        json={"body": body}, timeout=15,
+    )
+
+def _format_comment(sec: dict, perf: dict, verdict: dict, conflict: bool, duration: float) -> str:
+    sev_e = {"CRITICAL": "🔴", "HIGH": "🟠", "LOW": "🟡", "SAFE": "🟢"}
+    v     = verdict.get("verdict", "UNKNOWN")
+    v_e   = "✅" if "APPROVE" in v and "CONDITIONAL" not in v else "⚠️" if "CONDITIONAL" in v else "❌"
+    conflict_block = f"\n\n> ⚔️ **Conflict Resolved** — {verdict.get('conflict_resolution','')}" if conflict else ""
+    secrets_block  = f"\n\n> 🚨 **SECRETS DETECTED** — Rotate: `{'`, `'.join(sec.get('secrets_found', []))}`" if sec.get("secrets_found") else ""
+    findings = "\n".join(f"- {f}" for f in verdict.get("key_findings", []))
+    return (
+        f"## 🏛️ ShiftLeft Society — DevSecOps Tribunal\n\n"
+        f"{v_e} **Verdict: `{v}`** | ⏱️ {duration}s{conflict_block}{secrets_block}\n\n"
+        f"---\n\n"
+        f"### 🛡️ Security Auditor — {sev_e.get(sec.get('severity','').upper(),'⚪')} `{sec.get('severity','N/A')}`\n"
+        f"**{sec.get('title','')}**\n{sec.get('description','')}\n\n"
+        f"### ⚡ Performance Analyst — `{perf.get('severity','N/A')}`\n"
+        f"**{perf.get('title','')}**\n{perf.get('description','')}\n\n"
+        f"### 🔍 Key Findings\n{findings}\n\n"
+        f"### 📋 Remediation\n```python\n{verdict.get('remediation_code','# None generated.')}\n```\n\n"
+        f"---\n> 🤖 *ShiftLeft Society | Qwen-Max on Alibaba Cloud ECS*"
+    )
+
+@app.post("/webhook/github")
+async def github_webhook(
+    request: Request,
+    x_hub_signature_256: str = Header(None),
+    x_github_event:      str = Header(None),
+):
+    body = await request.body()
+    if not _verify_sig(body, x_hub_signature_256):
+        raise HTTPException(401, "Invalid signature.")
+    if x_github_event != "pull_request":
+        return {"status": "ignored", "event": x_github_event}
+
+    payload = json.loads(body)
+    if payload.get("action") not in ("opened", "synchronize"):
+        return {"status": "ignored", "action": payload.get("action")}
+
+    pr      = payload.get("pull_request", {})
+    repo    = payload.get("repository", {}).get("full_name", "")
+    pr_num  = pr.get("number")
+    pr_body = pr.get("body", pr.get("title", ""))
+    diff_url = pr.get("diff_url", "")
+
+    diff_code = f"# PR #{pr_num}: {pr.get('title','')}"
+    if diff_url:
+        try:
+            hdrs = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+            diff_code = requests.get(diff_url, headers=hdrs, timeout=15).text[:8000]
+        except Exception as e:
+            print(f"[Webhook] diff fetch failed: {e}")
+
+    run_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    active_jobs[run_id] = queue
+    p = CodePayload(code=diff_code, filename=f"pr_{pr_num}.diff", issue_description=pr_body)
+    asyncio.create_task(run_tribunal_task(run_id, p, queue))
+
+    result_ev = None
+    try:
+        while True:
+            ev = await asyncio.wait_for(queue.get(), timeout=180)
+            if ev.get("type") == "complete":
+                result_ev = ev; break
+            if ev.get("type") in ("error", "_sentinel", "timeout"):
+                break
+    except asyncio.TimeoutError:
+        pass
+
+    if result_ev:
+        _post_pr_comment(repo, pr_num, _format_comment(
+            result_ev.get("security", {}), result_ev.get("performance", {}),
+            result_ev.get("verdict", {}), result_ev.get("conflict_detected", False),
+            result_ev.get("duration_seconds", 0),
+        ))
+
+    active_jobs.pop(run_id, None)
+    return {"status": "analyzed", "pr": pr_num, "run_id": run_id}
+
+# =====================================================================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

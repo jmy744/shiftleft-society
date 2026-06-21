@@ -1,0 +1,21 @@
+# Environment & secrets — NEVER commit these
+.env
+*.env
+*.key
+*.pem
+secrets.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# SBOMs (generated at runtime)
+sbom_*.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
