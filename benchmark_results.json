@@ -1,0 +1,230 @@
+{
+  "total_cases": 20,
+  "baseline_accuracy": 90.0,
+  "tribunal_accuracy": 95.0,
+  "improvement": 5.0,
+  "baseline_correct": 18,
+  "tribunal_correct": 19,
+  "results": [
+    {
+      "id": "TC01",
+      "category": "SQL_INJECTION",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 1.48,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 11.19
+    },
+    {
+      "id": "TC02",
+      "category": "COMMAND_INJECTION",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 1.13,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 10.68
+    },
+    {
+      "id": "TC03",
+      "category": "HARDCODED_SECRET",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.72,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 10.81
+    },
+    {
+      "id": "TC04",
+      "category": "AWS_SECRET",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.47,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 12.7
+    },
+    {
+      "id": "TC05",
+      "category": "UNPINNED_YAML",
+      "expected": "vulnerable",
+      "baseline_answer": "SAFE",
+      "baseline_correct": false,
+      "baseline_time": 0.42,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 15.9
+    },
+    {
+      "id": "TC06",
+      "category": "INSECURE_DESERIALIZATION",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.52,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 12.13
+    },
+    {
+      "id": "TC07",
+      "category": "EVAL_INJECTION",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.54,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 11.28
+    },
+    {
+      "id": "TC08",
+      "category": "GITHUB_PAT",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.52,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 13.92
+    },
+    {
+      "id": "TC09",
+      "category": "FULL_TABLE_SCAN",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 1.43,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 13.13
+    },
+    {
+      "id": "TC10",
+      "category": "NESTED_LOOPS",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.9,
+      "tribunal_verdict": "CONDITIONAL APPROVAL",
+      "tribunal_correct": true,
+      "tribunal_time": 13.42
+    },
+    {
+      "id": "TC11",
+      "category": "UNSAFE_YAML",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.56,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 12.27
+    },
+    {
+      "id": "TC12",
+      "category": "OPEN_REDIRECT",
+      "expected": "vulnerable",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": true,
+      "baseline_time": 0.86,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": true,
+      "tribunal_time": 13.16
+    },
+    {
+      "id": "TC13",
+      "category": "PARAMETERIZED_QUERY",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.73,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 9.24
+    },
+    {
+      "id": "TC14",
+      "category": "ENV_VAR_SECRET",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.41,
+      "tribunal_verdict": "REJECT",
+      "tribunal_correct": false,
+      "tribunal_time": 13.65
+    },
+    {
+      "id": "TC15",
+      "category": "PINNED_YAML",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.47,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 12.96
+    },
+    {
+      "id": "TC16",
+      "category": "SAFE_YAML",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.53,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 10.61
+    },
+    {
+      "id": "TC17",
+      "category": "SINGLE_LOOP",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.47,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 8.98
+    },
+    {
+      "id": "TC18",
+      "category": "ASYNC_IO",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.78,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 10.05
+    },
+    {
+      "id": "TC19",
+      "category": "ORM_QUERY",
+      "expected": "safe",
+      "baseline_answer": "SAFE",
+      "baseline_correct": true,
+      "baseline_time": 0.57,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 12.95
+    },
+    {
+      "id": "TC20",
+      "category": "HASHED_PASSWORD",
+      "expected": "safe",
+      "baseline_answer": "VULNERABLE",
+      "baseline_correct": false,
+      "baseline_time": 0.49,
+      "tribunal_verdict": "APPROVE",
+      "tribunal_correct": true,
+      "tribunal_time": 13.95
+    }
+  ]
+}

@@ -2,22 +2,13 @@
 ShiftLeft Society — LangGraph Agent Society
 Track 3: Agent Society | Qwen Cloud Hackathon 2026
 
-v2.2 — NEGOTIATION UPGRADE (Confidence Budget Mechanic)
-
-Round 2 is no longer just rebuttals. Each agent enters with a finite confidence
-budget of 100 points. Defending their position against the other agent costs
-points proportional to the severity gap:
-
-    DEFEND  (hold original severity)        cost = gap_tier_count × 30
-    PARTIAL (move halfway toward other)     cost = 15
-    CONCEDE (adopt other agent's severity)  cost = 0
-
-The agent must consciously decide: is this issue worth my budget? This creates
-genuine negotiation — agents trade defense of strong positions for concession
-on weaker ones, with measurable resource depletion.
-
-Conflict threshold lowered from ≥2 to ≥1 tier so negotiation triggers whenever
-agents disagree at all, not only on extreme gaps.
+v2.4 — BULLETPROOF MEDIATOR
+  - Mediator uses raw ainvoke (not with_structured_output) to prevent
+    Qwen-Max runaway-token bug that kept hitting 8192-token ceiling.
+  - Robust JSON parsing with regex fallback.
+  - Severity-based verdict inference if mediator output is garbage.
+  - mediator_llm capped at 3000 max_tokens (separate instance).
+  - Nested-loop detection added to MCP fallback (fixes TC10).
 """
 
 import os
@@ -45,16 +36,21 @@ os.environ["OPENAI_API_KEY"] = _api_key
 os.environ["OPENAI_API_BASE"] = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
 MCP_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8001/mcp")
-llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=8192)
+
+# Round 1 + Round 2 agents — generous token budget, structured output works fine here
+llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=4096)
+
+# Mediator — separate instance with a hard 3000-token cap to prevent runaway.
+# Even if Qwen-Max goes off the rails it cannot burn 170+ seconds.
+mediator_llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=3000)
 
 # Negotiation parameters
 INITIAL_BUDGET = 100
-COST_PER_TIER  = 30   # gap_tiers × 30 = defend cost
-COST_PARTIAL   = 15   # partial agreement cost
+COST_PER_TIER  = 30
+COST_PARTIAL   = 15
 COST_CONCEDE   = 0
 
-# Severity → tier mapping (also used for routing)
-TIER = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0, "SAFE": 0, "UNKNOWN": -1}
+TIER = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0, "SAFE": 0, "INFO": 0, "UNKNOWN": -1}
 TIER_NAMES = {3: "CRITICAL", 2: "HIGH", 1: "MEDIUM", 0: "LOW"}
 
 
@@ -91,25 +87,51 @@ class TribunalState(TypedDict):
 
 
 # =====================================================================
-# 3. PYDANTIC SCHEMAS
+# 3. PYDANTIC SCHEMAS — Round 1 & Round 2 only (mediator no longer uses)
 # =====================================================================
+def _coerce_to_int(v, default: int = 80) -> int:
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return default
+    if isinstance(v, (int, float)):
+        return max(1, min(100, int(v)))
+    if isinstance(v, str):
+        SEVERITY_MAP = {"CRITICAL": 95, "HIGH": 85, "MEDIUM": 60, "LOW": 30, "SAFE": 20, "INFO": 20, "NONE": 10}
+        up = v.strip().upper()
+        if up in SEVERITY_MAP:
+            return SEVERITY_MAP[up]
+        m = re.search(r'-?\d+', v)
+        if m:
+            try:
+                return max(1, min(100, int(m.group(0))))
+            except ValueError:
+                pass
+    return default
+
+
 def _coerce_llm_output(data: dict) -> dict:
     STRING_FIELDS = {
         'reasoning_chain', 'title', 'description', 'fix', 'argument',
         'conflict_resolution', 'position', 'revised_severity', 'agent',
         'verdict', 'complexity_label', 'remediation_code', 'severity',
     }
-    LIST_STR_FIELDS = {
-        'secrets_found', 'mcp_findings', 'issues_found', 'key_findings',
-    }
+    LIST_STR_FIELDS = {'secrets_found', 'mcp_findings', 'issues_found', 'key_findings'}
+    INT_FIELDS = {'confidence_score'}
+
     for key, value in list(data.items()):
         if value is None:
             continue
-        if key in STRING_FIELDS:
+        if key in INT_FIELDS:
+            data[key] = _coerce_to_int(value, default=80)
+        elif key in STRING_FIELDS:
             if isinstance(value, list):
                 data[key] = ' '.join(str(i) for i in value)
             elif not isinstance(value, str):
                 data[key] = str(value)
+            else:
+                if key in ('severity', 'revised_severity'):
+                    data[key] = value.strip().upper()
         elif key in LIST_STR_FIELDS:
             if isinstance(value, dict):
                 data[key] = [f"{k}: {v}" for k, v in value.items() if v not in (None, [], {})]
@@ -123,8 +145,9 @@ def _coerce_llm_output(data: dict) -> dict:
                 data[key] = coerced
     return data
 
+
 class SecurityReport(BaseModel):
-    severity:        str  = Field(description="CRITICAL, HIGH, LOW, or SAFE")
+    severity:        str  = Field(description="CRITICAL, HIGH, MEDIUM, LOW, or SAFE")
     title:           str  = Field(default="Security Analysis")
     description:     str  = Field(default="")
     fix:             str  = Field(default="Review and remediate identified issues.")
@@ -138,7 +161,7 @@ class SecurityReport(BaseModel):
     def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
 
 class PerformanceReport(BaseModel):
-    severity:         str = Field(description="CRITICAL, HIGH, LOW, or SAFE")
+    severity:         str = Field(description="CRITICAL, HIGH, MEDIUM, LOW, or SAFE")
     title:            str = Field(default="Performance Analysis")
     description:      str = Field(default="")
     confidence_score: int = Field(default=85, ge=1, le=100)
@@ -150,30 +173,14 @@ class PerformanceReport(BaseModel):
     @classmethod
     def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
 
-# v2.2: Negotiation fields added
 class DebateResponse(BaseModel):
     agent:            str = Field(default="agent")
     position:         Literal["DEFEND", "PARTIAL", "CONCEDE"] = Field(
-        description="DEFEND = hold original severity (most expensive). "
-                    "PARTIAL = move halfway toward other agent. "
-                    "CONCEDE = adopt other agent's severity (free)."
+        description="DEFEND = hold severity. PARTIAL = move halfway. CONCEDE = adopt other."
     )
     argument:         str = Field(default="No rebuttal provided.")
-    revised_severity: str = Field(default="HIGH", description="CRITICAL, HIGH, MEDIUM, LOW, or SAFE")
+    revised_severity: str = Field(default="HIGH", description="CRITICAL/HIGH/MEDIUM/LOW/SAFE")
     confidence_score: int = Field(default=80, ge=1, le=100)
-
-    @model_validator(mode='before')
-    @classmethod
-    def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
-
-class MediatorVerdict(BaseModel):
-    verdict:             Literal["APPROVE", "CONDITIONAL APPROVAL", "REJECT"] = Field(
-        description="Final tribunal ruling. MUST be exactly one of: APPROVE, CONDITIONAL APPROVAL, REJECT."
-    )
-    remediation_code:    str       = Field(default="# No remediation generated.")
-    promise_verified:    bool      = Field(default=False)
-    conflict_resolution: str       = Field(default="No conflict detected.")
-    key_findings:        List[str] = Field(default=[])
 
     @model_validator(mode='before')
     @classmethod
@@ -181,7 +188,7 @@ class MediatorVerdict(BaseModel):
 
 
 # =====================================================================
-# 4. MCP CLIENT (unchanged from v2.1)
+# 4. MCP CLIENT
 # =====================================================================
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     try:
@@ -226,9 +233,20 @@ def _internal_fallback(tool_name: str, arguments: dict) -> dict:
         issues = []
         if re.search(r'SELECT\s+\*|\.get_all\s*\(', code, re.IGNORECASE):
             issues.append({"type": "FULL_TABLE_SCAN", "severity": "HIGH"})
+
+        # v2.4: detect nested for-loops (O(n²)+) — fixes TC10
+        nested = len(re.findall(r'\bfor\b[^\n]*:\s*\n\s+for\b', code))
+        if nested >= 2:
+            issues.append({"type": "TRIPLE_NESTED_LOOP", "severity": "CRITICAL", "depth": nested + 1})
+        elif nested >= 1:
+            issues.append({"type": "NESTED_LOOP", "severity": "HIGH", "depth": 2})
+
         complexity = len(re.findall(r'\b(if|elif|for|while|except)\b', code)) + 1
-        return {"performance_issues": issues, "cyclomatic_complexity": complexity,
-                "severity": "HIGH" if issues else "SAFE"}
+        highest = "SAFE"
+        for i in issues:
+            if _tier(i["severity"]) > _tier(highest):
+                highest = i["severity"]
+        return {"performance_issues": issues, "cyclomatic_complexity": complexity, "severity": highest}
     return {}
 
 async def verify_mcp_server() -> bool:
@@ -250,19 +268,19 @@ def _generate_sbom(code: str, filename: str, run_id: str) -> dict:
         "serialNumber": f"urn:uuid:{run_id}",
         "metadata": {
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "tools": [{"vendor": "ShiftLeft Society", "name": "Tribunal", "version": "2.2"}],
+            "tools": [{"vendor": "ShiftLeft Society", "name": "Tribunal", "version": "2.4"}],
             "component": {
                 "type": "application", "name": filename,
                 "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(code.encode()).hexdigest()}],
             },
         },
         "components": [],
-        "dependencies": [{"ref": filename, "validator": "ShiftLeft Society Tribunal v2.2"}],
+        "dependencies": [{"ref": filename, "validator": "ShiftLeft Society Tribunal v2.4"}],
     }
 
 
 # =====================================================================
-# 5. NEGOTIATION HELPERS (new in v2.2)
+# 5. NEGOTIATION HELPERS
 # =====================================================================
 def _tier(severity: str) -> int:
     return TIER.get((severity or "UNKNOWN").upper(), -1)
@@ -270,18 +288,7 @@ def _tier(severity: str) -> int:
 def _sev_name(tier: int) -> str:
     return TIER_NAMES.get(max(0, min(3, tier)), "UNKNOWN")
 
-def _compute_negotiation(
-    my_severity: str,
-    other_severity: str,
-    position: str,
-) -> dict:
-    """
-    Given an agent's original severity, the other agent's severity, and the
-    agent's chosen position (DEFEND / PARTIAL / CONCEDE), compute:
-      - revised_severity (where the agent lands)
-      - budget_spent (cost of that choice)
-      - budget_remaining
-    """
+def _compute_negotiation(my_severity: str, other_severity: str, position: str) -> dict:
     my_t    = _tier(my_severity)
     other_t = _tier(other_severity)
     gap     = abs(my_t - other_t)
@@ -290,32 +297,175 @@ def _compute_negotiation(
         revised = my_severity.upper()
         spent   = gap * COST_PER_TIER
     elif position == "PARTIAL":
-        # Land halfway between the two tiers, rounded toward the higher (safer) one
         mid = (my_t + other_t) / 2
-        revised = _sev_name(int(round(mid + 0.01)))  # +0.01 breaks ties upward
+        revised = _sev_name(int(round(mid + 0.01)))
         spent   = COST_PARTIAL
-    else:  # CONCEDE
+    else:
         revised = other_severity.upper()
         spent   = COST_CONCEDE
 
-    # Enforce budget — if the agent can't afford to defend, force concession
     if spent > INITIAL_BUDGET:
         revised = other_severity.upper()
         spent   = INITIAL_BUDGET
         position = "CONCEDE"
 
     return {
-        "position":          position,
-        "revised_severity":  revised,
-        "budget_spent":      spent,
-        "budget_remaining":  INITIAL_BUDGET - spent,
-        "gap_tiers":         gap,
-        "defend_cost":       gap * COST_PER_TIER,
+        "position":         position,
+        "revised_severity": revised,
+        "budget_spent":     spent,
+        "budget_remaining": INITIAL_BUDGET - spent,
+        "gap_tiers":        gap,
+        "defend_cost":      gap * COST_PER_TIER,
     }
 
 
 # =====================================================================
-# 6. AGENT NODES
+# 6. MEDIATOR HELPERS — robust parsing & severity-based fallback
+# =====================================================================
+def _infer_verdict_from_state(state: TribunalState) -> str:
+    """If mediator output is unusable, infer verdict from negotiated (or R1) severities."""
+    sec_sev = state.get("security_severity", "UNKNOWN")
+    perf_sev = state.get("performance_severity", "UNKNOWN")
+
+    # Prefer negotiated severities if Round 2 ran
+    sec_r2 = state.get("security_r2", {}) or {}
+    perf_r2 = state.get("performance_r2", {}) or {}
+    if sec_r2.get("revised_severity"):
+        sec_sev = sec_r2["revised_severity"]
+    if perf_r2.get("revised_severity"):
+        perf_sev = perf_r2["revised_severity"]
+
+    highest = max(_tier(sec_sev), _tier(perf_sev))
+    if highest >= 3:
+        return "REJECT"
+    if highest == 2:
+        return "CONDITIONAL APPROVAL"
+    return "APPROVE"
+
+
+def _parse_mediator_text(text: str, state: TribunalState) -> dict:
+    """
+    Robust mediator output parser. Handles:
+      - Clean JSON
+      - JSON wrapped in markdown code blocks
+      - Partial/truncated JSON (regex-extracts what it can)
+      - Total garbage (falls back to severity-based verdict)
+    """
+    # Strip markdown code fences
+    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+
+    parsed = None
+    # Try clean JSON parse
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Try to recover the largest valid JSON object substring
+        first_brace = cleaned.find('{')
+        last_brace = cleaned.rfind('}')
+        if first_brace != -1 and last_brace > first_brace:
+            try:
+                parsed = json.loads(cleaned[first_brace:last_brace + 1])
+            except json.JSONDecodeError:
+                parsed = None
+
+    # If we have a dict, normalize it
+    if isinstance(parsed, dict):
+        verdict = (parsed.get("verdict") or "").strip().upper()
+        if "REJECT" in verdict:
+            verdict = "REJECT"
+        elif "CONDITIONAL" in verdict:
+            verdict = "CONDITIONAL APPROVAL"
+        elif "APPROVE" in verdict:
+            verdict = "APPROVE"
+        else:
+            verdict = _infer_verdict_from_state(state)
+
+        return {
+            "verdict":             verdict,
+            "remediation_code":    str(parsed.get("remediation_code") or "# Remediation not generated."),
+            "promise_verified":    bool(parsed.get("promise_verified", False)),
+            "conflict_resolution": str(parsed.get("conflict_resolution") or _default_resolution(state)),
+            "key_findings":        _normalize_findings(parsed.get("key_findings")),
+        }
+
+    # No usable JSON — regex extraction
+    verdict = None
+    verdict_match = re.search(r'"verdict"\s*:\s*"([^"]+)"', cleaned, re.IGNORECASE)
+    if verdict_match:
+        v = verdict_match.group(1).strip().upper()
+        if "REJECT" in v: verdict = "REJECT"
+        elif "CONDITIONAL" in v: verdict = "CONDITIONAL APPROVAL"
+        elif "APPROVE" in v: verdict = "APPROVE"
+    if not verdict:
+        verdict = _infer_verdict_from_state(state)
+
+    findings_match = re.search(r'"key_findings"\s*:\s*\[([^\]]*)\]', cleaned, re.DOTALL)
+    findings = []
+    if findings_match:
+        findings = re.findall(r'"((?:[^"\\]|\\.)*)"', findings_match.group(1))[:5]
+
+    remediation_match = re.search(r'"remediation_code"\s*:\s*"((?:[^"\\]|\\.)*)"', cleaned, re.DOTALL)
+    remediation = "# Remediation truncated. See finding descriptions."
+    if remediation_match:
+        try:
+            remediation = remediation_match.group(1).encode('utf-8').decode('unicode_escape')
+        except Exception:
+            remediation = remediation_match.group(1)
+
+    return {
+        "verdict":             verdict,
+        "remediation_code":    remediation,
+        "promise_verified":    False,
+        "conflict_resolution": _default_resolution(state),
+        "key_findings":        findings or _default_findings(state),
+    }
+
+
+def _normalize_findings(raw) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        out = []
+        for item in raw:
+            if isinstance(item, dict):
+                out.append(item.get("description") or item.get("type") or str(item))
+            elif item is not None:
+                out.append(str(item))
+        return out[:5]
+    return [str(raw)]
+
+
+def _default_resolution(state: TribunalState) -> str:
+    if not state.get("conflict_detected"):
+        return "Agents agreed in Round 1 — no negotiation required."
+    sec_r2 = state.get("security_r2", {}) or {}
+    perf_r2 = state.get("performance_r2", {}) or {}
+    return (
+        f"Security chose {sec_r2.get('position','?')} "
+        f"→ {sec_r2.get('revised_severity','?')} "
+        f"(spent {sec_r2.get('budget_spent','?')}/{INITIAL_BUDGET}). "
+        f"Performance chose {perf_r2.get('position','?')} "
+        f"→ {perf_r2.get('revised_severity','?')} "
+        f"(spent {perf_r2.get('budget_spent','?')}/{INITIAL_BUDGET})."
+    )
+
+
+def _default_findings(state: TribunalState) -> List[str]:
+    sec_r1 = state.get("security_r1", {}) or {}
+    perf_r1 = state.get("performance_r1", {}) or {}
+    findings = []
+    if sec_r1.get("title"):
+        findings.append(f"Security: {sec_r1['title']}")
+    if perf_r1.get("title"):
+        findings.append(f"Performance: {perf_r1['title']}")
+    return findings or ["Tribunal analysis complete."]
+
+
+# =====================================================================
+# 7. AGENT NODES
 # =====================================================================
 async def initialize(state: TribunalState) -> dict:
     mcp_ok = await verify_mcp_server()
@@ -343,13 +493,15 @@ async def security_auditor_r1(state: TribunalState) -> dict:
         if yaml_d.get("unpinned_actions") else ""
     )
     prompt = (
-        f"You are the Elite Security Auditor in the ShiftLeft Society DevSecOps Tribunal.\n"
+        f"You are the Elite Security Auditor.\n"
         f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n"
         f"CODE:\n```\n{state['code']}\n```\n"
-        f"MCP RESULTS: {json.dumps({'vulns': vuln.get('findings',[]), 'secrets': secret.get('secrets_detected',[]), 'yaml': yaml_d}, indent=2)}\n"
+        f"MCP: {json.dumps({'vulns': vuln.get('findings',[]), 'secrets': secret.get('secrets_detected',[]), 'yaml': yaml_d}, indent=2)}\n"
         f"{secrets_alert}{yaml_alert}\n"
-        f"Your findings will be challenged by the Performance Analyst — be precise and defend your position.\n"
-        f"Output flat JSON: severity, title, description, fix, confidence_score, reasoning_chain, secrets_found, mcp_findings."
+        f"Output flat JSON. severity: CRITICAL/HIGH/MEDIUM/LOW/SAFE. "
+        f"confidence_score: INTEGER 1-100. "
+        f"Other fields: title, description (≤2 sentences), fix, reasoning_chain (≤2 sentences), "
+        f"secrets_found, mcp_findings."
     )
     report = await llm.with_structured_output(SecurityReport).ainvoke(prompt)
     rd = report.model_dump()
@@ -361,12 +513,15 @@ async def performance_analyst_r1(state: TribunalState) -> dict:
     print("[Performance R1] Profiling complexity...")
     complexity = await call_mcp_tool("analyze_complexity", {"code": state["code"]})
     prompt = (
-        f"You are the Performance Analyst in the ShiftLeft Society DevSecOps Tribunal.\n"
+        f"You are the Performance Analyst.\n"
         f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n"
         f"CODE:\n```\n{state['code']}\n```\n"
-        f"AST COMPLEXITY MCP RESULTS: {json.dumps(complexity, indent=2)}\n"
-        f"Your findings will be challenged by the Security Auditor — be precise and defend your position.\n"
-        f"Output flat JSON: severity, title, description, confidence_score, reasoning_chain, complexity_label, issues_found."
+        f"MCP: {json.dumps(complexity, indent=2)}\n"
+        f"If MCP flagged NESTED_LOOP or TRIPLE_NESTED_LOOP, severity MUST be HIGH or CRITICAL respectively.\n"
+        f"Output flat JSON. severity: CRITICAL/HIGH/MEDIUM/LOW/SAFE. "
+        f"confidence_score: INTEGER 1-100. "
+        f"Other fields: title, description (≤2 sentences), reasoning_chain (≤2 sentences), "
+        f"complexity_label, issues_found."
     )
     report = await llm.with_structured_output(PerformanceReport).ainvoke(prompt)
     rd = report.model_dump()
@@ -377,17 +532,18 @@ async def performance_analyst_r1(state: TribunalState) -> dict:
 def merge_round1(state: TribunalState) -> dict:
     sec  = next((r for r in state["round1_reports"] if r.get("role") == "security"),    {})
     perf = next((r for r in state["round1_reports"] if r.get("role") == "performance"), {})
-    s_tier = _tier(sec.get("severity",  "UNKNOWN"))
-    p_tier = _tier(perf.get("severity", "UNKNOWN"))
+    sec_sev_upper  = (sec.get("severity",  "UNKNOWN") or "UNKNOWN").upper()
+    perf_sev_upper = (perf.get("severity", "UNKNOWN") or "UNKNOWN").upper()
+    s_tier = _tier(sec_sev_upper)
+    p_tier = _tier(perf_sev_upper)
     gap    = abs(s_tier - p_tier)
-    # v2.2: threshold lowered from >= 2 to >= 1 — any disagreement triggers negotiation
     conflict = gap >= 1
-    print(f"[merge_round1] Security={sec.get('severity')} vs Performance={perf.get('severity')} | Gap={gap} | Negotiation={conflict}")
+    print(f"[merge_round1] Security={sec_sev_upper} vs Performance={perf_sev_upper} | Gap={gap} | Negotiation={conflict}")
     return {
         "security_r1":          sec,
         "performance_r1":       perf,
-        "security_severity":    sec.get("severity",  "UNKNOWN").upper(),
-        "performance_severity": perf.get("severity", "UNKNOWN").upper(),
+        "security_severity":    sec_sev_upper,
+        "performance_severity": perf_sev_upper,
         "severity_gap":         gap,
         "conflict_detected":    conflict,
     }
@@ -398,39 +554,24 @@ async def security_debates(state: TribunalState) -> dict:
     other_sev = state["performance_severity"]
     gap       = state.get("severity_gap", 1)
     defend_cost = gap * COST_PER_TIER
-
     prompt = (
-        f"You are the Security Auditor in Round 2 of the ShiftLeft Society Tribunal.\n\n"
-        f"NEGOTIATION RULES:\n"
-        f"You entered Round 2 with a confidence budget of {INITIAL_BUDGET} points.\n"
-        f"Your Round 1 severity: {my_sev}\n"
-        f"Performance Analyst's Round 1 severity: {other_sev}\n"
-        f"Severity gap: {gap} tier(s)\n\n"
-        f"You must choose ONE position:\n"
-        f"  • DEFEND   — Hold your original severity ({my_sev}). Costs {defend_cost} budget.\n"
-        f"  • PARTIAL  — Move halfway toward {other_sev}. Costs {COST_PARTIAL} budget.\n"
-        f"  • CONCEDE  — Adopt {other_sev} fully. Costs {COST_CONCEDE} budget.\n\n"
-        f"Choose carefully — the budget represents your conviction. Defending costs more when\n"
-        f"the gap is larger because you're claiming the other expert is more wrong.\n"
-        f"Defend only when you genuinely believe the security risk justifies the cost.\n\n"
-        f"YOUR ROUND 1 FINDINGS: {json.dumps(state['security_r1'], indent=2)}\n\n"
-        f"PERFORMANCE ANALYST'S FINDINGS:\n{json.dumps(state['performance_r1'], indent=2)}\n\n"
-        f"Output flat JSON: agent, position (DEFEND/PARTIAL/CONCEDE), argument (explain your choice), "
-        f"revised_severity (CRITICAL/HIGH/MEDIUM/LOW/SAFE), confidence_score."
+        f"Security Auditor — Round 2.\n"
+        f"Confidence budget: {INITIAL_BUDGET}.\n"
+        f"Your R1: {my_sev} | Other: {other_sev} | Gap: {gap} tier(s)\n"
+        f"Positions: DEFEND (cost {defend_cost}) | PARTIAL (cost {COST_PARTIAL}) | CONCEDE (cost {COST_CONCEDE}).\n"
+        f"YOUR R1 REPORT: {json.dumps(state['security_r1'], indent=2)}\n"
+        f"PERFORMANCE R1: {json.dumps(state['performance_r1'], indent=2)}\n"
+        f"Output flat JSON: agent, position (DEFEND/PARTIAL/CONCEDE), argument (1-2 sentences), "
+        f"revised_severity (CRITICAL/HIGH/MEDIUM/LOW/SAFE), confidence_score (INTEGER 1-100)."
     )
     resp = await llm.with_structured_output(DebateResponse).ainvoke(prompt)
     rd = resp.model_dump()
-
-    # Apply negotiation math — enforces budget rules regardless of LLM output
     nego = _compute_negotiation(my_sev, other_sev, rd["position"])
     rd.update(nego)
     rd["role"] = "security_r2"
-
     msg: AgentMessage = {
-        "sender": "Security Auditor (Round 2)",
-        "round":  2,
-        "content": json.dumps(rd),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "sender": "Security Auditor (Round 2)", "round": 2,
+        "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z",
     }
     print(f"[Security R2] {rd['position']} → {rd['revised_severity']} (spent {rd['budget_spent']}/{INITIAL_BUDGET})")
     return {"round2_responses": [rd], "dialogue_history": [msg]}
@@ -441,38 +582,24 @@ async def performance_debates(state: TribunalState) -> dict:
     other_sev = state["security_severity"]
     gap       = state.get("severity_gap", 1)
     defend_cost = gap * COST_PER_TIER
-
     prompt = (
-        f"You are the Performance Analyst in Round 2 of the ShiftLeft Society Tribunal.\n\n"
-        f"NEGOTIATION RULES:\n"
-        f"You entered Round 2 with a confidence budget of {INITIAL_BUDGET} points.\n"
-        f"Your Round 1 severity: {my_sev}\n"
-        f"Security Auditor's Round 1 severity: {other_sev}\n"
-        f"Severity gap: {gap} tier(s)\n\n"
-        f"You must choose ONE position:\n"
-        f"  • DEFEND   — Hold your original severity ({my_sev}). Costs {defend_cost} budget.\n"
-        f"  • PARTIAL  — Move halfway toward {other_sev}. Costs {COST_PARTIAL} budget.\n"
-        f"  • CONCEDE  — Adopt {other_sev} fully. Costs {COST_CONCEDE} budget.\n\n"
-        f"Choose carefully — the budget represents your conviction. Defending costs more when\n"
-        f"the gap is larger. Performance issues are real but often mitigable post-deploy,\n"
-        f"so defending a high severity is a meaningful commitment.\n\n"
-        f"YOUR ROUND 1 FINDINGS: {json.dumps(state['performance_r1'], indent=2)}\n\n"
-        f"SECURITY AUDITOR'S FINDINGS:\n{json.dumps(state['security_r1'], indent=2)}\n\n"
-        f"Output flat JSON: agent, position (DEFEND/PARTIAL/CONCEDE), argument (explain your choice), "
-        f"revised_severity (CRITICAL/HIGH/MEDIUM/LOW/SAFE), confidence_score."
+        f"Performance Analyst — Round 2.\n"
+        f"Confidence budget: {INITIAL_BUDGET}.\n"
+        f"Your R1: {my_sev} | Other: {other_sev} | Gap: {gap} tier(s)\n"
+        f"Positions: DEFEND (cost {defend_cost}) | PARTIAL (cost {COST_PARTIAL}) | CONCEDE (cost {COST_CONCEDE}).\n"
+        f"YOUR R1 REPORT: {json.dumps(state['performance_r1'], indent=2)}\n"
+        f"SECURITY R1: {json.dumps(state['security_r1'], indent=2)}\n"
+        f"Output flat JSON: agent, position (DEFEND/PARTIAL/CONCEDE), argument (1-2 sentences), "
+        f"revised_severity (CRITICAL/HIGH/MEDIUM/LOW/SAFE), confidence_score (INTEGER 1-100)."
     )
     resp = await llm.with_structured_output(DebateResponse).ainvoke(prompt)
     rd = resp.model_dump()
-
     nego = _compute_negotiation(my_sev, other_sev, rd["position"])
     rd.update(nego)
     rd["role"] = "performance_r2"
-
     msg: AgentMessage = {
-        "sender": "Performance Analyst (Round 2)",
-        "round":  2,
-        "content": json.dumps(rd),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "sender": "Performance Analyst (Round 2)", "round": 2,
+        "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z",
     }
     print(f"[Performance R2] {rd['position']} → {rd['revised_severity']} (spent {rd['budget_spent']}/{INITIAL_BUDGET})")
     return {"round2_responses": [rd], "dialogue_history": [msg]}
@@ -483,62 +610,71 @@ def merge_round2(state: TribunalState) -> dict:
     return {"security_r2": sec_r2, "performance_r2": perf_r2}
 
 async def lead_mediator(state: TribunalState) -> dict:
+    """
+    v2.4: Uses raw ainvoke + robust parsing instead of with_structured_output.
+    Even if Qwen-Max produces garbage, we ALWAYS return a valid verdict.
+    """
     print("[Lead Mediator] Synthesizing...")
+
     debate_log = "\n\n".join(
-        f"[{m['sender']} | Round {m['round']} | {m['timestamp']}]\n{m['content']}"
+        f"[{m['sender']} | R{m['round']}]\n{m['content']}"
         for m in state.get("dialogue_history", [])
     )
 
-    # Build negotiation summary if Round 2 happened
     negotiation_summary = ""
     if state.get("conflict_detected"):
         sec_r2  = state.get("security_r2",  {})
         perf_r2 = state.get("performance_r2", {})
-        negotiated_severities = []
-        if sec_r2.get("revised_severity"):
-            negotiated_severities.append(sec_r2["revised_severity"])
-        if perf_r2.get("revised_severity"):
-            negotiated_severities.append(perf_r2["revised_severity"])
-        # Highest negotiated severity determines the verdict
-        highest_negotiated = "SAFE"
-        if negotiated_severities:
-            highest_negotiated = max(negotiated_severities, key=lambda s: _tier(s))
-
+        negotiated = []
+        if sec_r2.get("revised_severity"):  negotiated.append(sec_r2["revised_severity"])
+        if perf_r2.get("revised_severity"): negotiated.append(perf_r2["revised_severity"])
+        highest = max(negotiated, key=lambda s: _tier(s)) if negotiated else "SAFE"
         negotiation_summary = (
-            f"NEGOTIATION OUTCOME (Round 2):\n"
-            f"  Security Auditor: {sec_r2.get('position','?')} "
-            f"→ {sec_r2.get('revised_severity','?')} "
-            f"(spent {sec_r2.get('budget_spent','?')}/{INITIAL_BUDGET} budget)\n"
-            f"  Performance Analyst: {perf_r2.get('position','?')} "
-            f"→ {perf_r2.get('revised_severity','?')} "
-            f"(spent {perf_r2.get('budget_spent','?')}/{INITIAL_BUDGET} budget)\n"
-            f"  Highest negotiated severity: {highest_negotiated}\n"
-            f"  Use the NEGOTIATED severities (not the Round 1 originals) for your verdict mapping.\n"
-            f"  Cite the negotiation explicitly in your conflict_resolution.\n"
+            f"\nNEGOTIATION RESULT: highest negotiated severity = {highest}. "
+            f"Use this severity for verdict mapping.\n"
         )
 
-    prompt = (
-        f"You are the Supreme Lead Mediator of the ShiftLeft Society DevSecOps Tribunal.\n"
-        f"PROMISE: {state['issue_description']}\nFILE: {state['filename']}\n\n"
-        f"FULL DEBATE TRANSCRIPT:\n{debate_log}\n\n{negotiation_summary}\n"
-        f"TASKS:\n"
-        f"1. Promise Verification: Does the code deliver the ticket promise? Set promise_verified.\n"
-        f"2. Verdict — REQUIRED mapping (use the NEGOTIATED severities if Round 2 happened):\n"
-        f"   - Highest severity CRITICAL  → verdict MUST be exactly 'REJECT'\n"
-        f"   - Highest severity HIGH      → verdict MUST be exactly 'CONDITIONAL APPROVAL'\n"
-        f"   - Highest severity MEDIUM/LOW/SAFE → verdict MUST be exactly 'APPROVE'\n"
-        f"   The verdict field is NEVER a severity label.\n"
-        f"3. Conflict Resolution: If a negotiation occurred, explicitly describe how each agent\n"
-        f"   spent their budget and what the final negotiated position is. 2-3 sentences.\n"
-        f"4. Remediation Code: Complete fixed code addressing ALL identified issues.\n"
-        f"   Concise but complete drop-in replacement. No markdown. No backticks. Raw code only.\n"
-        f"5. Key Findings: Top 3-5 issues as short bullet phrases.\n\n"
-        f"Output flat JSON: verdict, remediation_code, promise_verified, conflict_resolution, key_findings."
-    )
-    verdict = await llm.with_structured_output(MediatorVerdict).ainvoke(prompt)
-    vd = verdict.model_dump()
+    code_lines = state['code'].count('\n') + 1
+    if code_lines < 20:
+        length_rule = "remediation_code ≤ 15 lines. conflict_resolution ≤ 2 sentences. key_findings ≤ 3."
+    else:
+        length_rule = "remediation_code ≤ 40 lines. conflict_resolution ≤ 3 sentences. key_findings ≤ 5."
 
-    if verdict.verdict == "APPROVE":
+    prompt = (
+        f"You are the Lead Mediator. BE EXTREMELY CONCISE.\n"
+        f"PROMISE: {state['issue_description']}\nFILE: {state['filename']}\n"
+        f"{negotiation_summary}\n"
+        f"TRANSCRIPT (for context — do not echo back):\n{debate_log[:2500]}\n\n"
+        f"LENGTH: {length_rule}\n\n"
+        f"VERDICT MAPPING (strict):\n"
+        f"  highest severity CRITICAL → verdict = 'REJECT'\n"
+        f"  highest severity HIGH     → verdict = 'CONDITIONAL APPROVAL'\n"
+        f"  highest severity MEDIUM/LOW/SAFE → verdict = 'APPROVE'\n\n"
+        f"Output ONE JSON object, nothing else, no markdown:\n"
+        f'{{"verdict": "APPROVE|CONDITIONAL APPROVAL|REJECT", '
+        f'"remediation_code": "raw code only no backticks", '
+        f'"promise_verified": true|false, '
+        f'"conflict_resolution": "brief explanation", '
+        f'"key_findings": ["short", "phrases"]}}'
+    )
+
+    vd = None
+    try:
+        # Raw ainvoke — no structured output. Mediator's 3000 token cap prevents runaway.
+        response = await mediator_llm.ainvoke(prompt)
+        raw_text = response.content if hasattr(response, "content") else str(response)
+        vd = _parse_mediator_text(raw_text, state)
+    except Exception as e:
+        print(f"[Lead Mediator] LLM call failed: {e}. Falling back to severity-based verdict.")
+        vd = {
+            "verdict":             _infer_verdict_from_state(state),
+            "remediation_code":    "# Mediator unavailable. Apply Round 1 fix recommendations.",
+            "promise_verified":    False,
+            "conflict_resolution": _default_resolution(state),
+            "key_findings":        _default_findings(state),
+        }
+
+    if vd.get("verdict") == "APPROVE":
         vd["sbom"] = _generate_sbom(state["code"], state["filename"], state["run_id"])
 
     msg: AgentMessage = {
@@ -546,11 +682,12 @@ async def lead_mediator(state: TribunalState) -> dict:
         "content": json.dumps(vd),
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
+    print(f"[Lead Mediator] verdict={vd.get('verdict')}")
     return {"final_verdict": vd, "dialogue_history": [msg]}
 
 
 # =====================================================================
-# 7. ROUTING
+# 8. ROUTING
 # =====================================================================
 def fan_out_round1(state: TribunalState) -> list:
     return [
@@ -568,7 +705,7 @@ def route_after_conflict(state: TribunalState):
 
 
 # =====================================================================
-# 8. BUILD GRAPH
+# 9. BUILD GRAPH
 # =====================================================================
 builder = StateGraph(TribunalState)
 
