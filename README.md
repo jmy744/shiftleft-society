@@ -1,4 +1,5 @@
 # ShiftLeft Society — DevSecOps Tribunal
+**🔗 Live Demo:** https://shiftleft-society.duckdns.org
 
 > **Qwen Cloud Global AI Hackathon 2026 | Track 3: Agent Society**
 > A multi-agent system where specialist AI agents debate, resolve conflicts, and deliver verdicts on code quality.
