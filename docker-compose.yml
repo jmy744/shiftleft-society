@@ -1,0 +1,39 @@
+# ShiftLeft Society — local dev / cloud deployment compose
+# Usage:
+#   1. Create .env file (next to this one) with: QWEN_API_KEY=sk-...
+#   2. docker compose up --build       (first time)
+#      docker compose up               (subsequent runs)
+#   3. Open http://localhost:8000 in your browser
+
+services:
+  shiftleft:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shiftleft-tribunal
+    ports:
+      - "8000:8000"
+    environment:
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      MCP_PORT: "8001"
+      MCP_SERVER_URL: "http://localhost:8001/mcp"
+    # Bootstraps the database with the v3 schema before launching the API.
+    # init_db creates base tables. migrate_v3 adds total_tokens, cost_usd,
+    # duration_seconds, etc. Both are idempotent — safe to run on every start.
+    command:
+      - sh
+      - -c
+      - |
+        echo "[init] Creating base database schema..." && \
+        python -c "import asyncio, database; asyncio.run(database.init_db())" && \
+        echo "[init] Applying v3 migrations..." && \
+        python migrate_v3.py 2>&1 || true && \
+        echo "[init] Starting API server..." && \
+        exec python api.py
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,38 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# Git
+.git/
+.gitignore
+
+# Secrets — never bake into image
+.env
+.env.local
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local artifacts
+*.log
+tribunal_history.db
+benchmark_results.json
+SESSION_*.md
+
+# Docker meta
+Dockerfile
+docker-compose.yml
+.dockerignore

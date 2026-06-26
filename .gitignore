@@ -19,3 +19,6 @@ sbom_*.json
 .vscode/
 .idea/
 *.swp
+# Local database — never commit test data
+tribunal_history.db
+*.db-journal

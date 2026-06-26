@@ -493,15 +493,22 @@ async def security_auditor_r1(state: TribunalState) -> dict:
         if yaml_d.get("unpinned_actions") else ""
     )
     prompt = (
-        f"You are the Elite Security Auditor.\n"
-        f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n"
-        f"CODE:\n```\n{state['code']}\n```\n"
-        f"MCP: {json.dumps({'vulns': vuln.get('findings',[]), 'secrets': secret.get('secrets_detected',[]), 'yaml': yaml_d}, indent=2)}\n"
+        f"You are the Elite Security Auditor in the ShiftLeft Society DevSecOps Tribunal.\n"
+        f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n\n"
+        f"CODE TO ANALYZE:\n```\n{state['code']}\n```\n\n"
+        f"REFERENCE MCP TOOL FINDINGS (use as evidence, do NOT echo back):\n"
+        f"{json.dumps({'vulns': vuln.get('findings',[]), 'secrets': secret.get('secrets_detected',[]), 'yaml': yaml_d}, indent=2)}\n"
         f"{secrets_alert}{yaml_alert}\n"
-        f"Output flat JSON. severity: CRITICAL/HIGH/MEDIUM/LOW/SAFE. "
-        f"confidence_score: INTEGER 1-100. "
-        f"Other fields: title, description (≤2 sentences), fix, reasoning_chain (≤2 sentences), "
-        f"secrets_found, mcp_findings."
+        f"Your findings will be challenged by the Performance Analyst — be precise and decisive.\n\n"
+        f"YOUR TASK: Output a flat JSON object with these REQUIRED fields:\n"
+        f"  - severity: one of 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'SAFE'\n"
+        f"  - title: short headline\n"
+        f"  - description: ≤2 sentence explanation\n"
+        f"  - fix: suggested remediation approach\n"
+        f"  - confidence_score: INTEGER between 1 and 100\n"
+        f"  - reasoning_chain: ≤2 sentence chain of reasoning\n"
+        f"  - secrets_found: list of secret names if any\n"
+        f"  - mcp_findings: list of MCP-flagged issues"
     )
     report = await llm.with_structured_output(SecurityReport).ainvoke(prompt)
     rd = report.model_dump()
@@ -513,15 +520,21 @@ async def performance_analyst_r1(state: TribunalState) -> dict:
     print("[Performance R1] Profiling complexity...")
     complexity = await call_mcp_tool("analyze_complexity", {"code": state["code"]})
     prompt = (
-        f"You are the Performance Analyst.\n"
-        f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n"
-        f"CODE:\n```\n{state['code']}\n```\n"
-        f"MCP: {json.dumps(complexity, indent=2)}\n"
+        f"You are the Performance Analyst in the ShiftLeft Society DevSecOps Tribunal.\n"
+        f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n\n"
+        f"CODE TO ANALYZE:\n```\n{state['code']}\n```\n\n"
+        f"REFERENCE MCP COMPLEXITY FINDINGS (use as evidence, do NOT echo back):\n"
+        f"{json.dumps(complexity, indent=2)}\n"
         f"If MCP flagged NESTED_LOOP or TRIPLE_NESTED_LOOP, severity MUST be HIGH or CRITICAL respectively.\n"
-        f"Output flat JSON. severity: CRITICAL/HIGH/MEDIUM/LOW/SAFE. "
-        f"confidence_score: INTEGER 1-100. "
-        f"Other fields: title, description (≤2 sentences), reasoning_chain (≤2 sentences), "
-        f"complexity_label, issues_found."
+        f"Your findings will be challenged by the Security Auditor — be precise and decisive.\n\n"
+        f"YOUR TASK: Output a flat JSON object with these REQUIRED fields:\n"
+        f"  - severity: one of 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'SAFE'\n"
+        f"  - title: short headline\n"
+        f"  - description: ≤2 sentence explanation\n"
+        f"  - confidence_score: INTEGER between 1 and 100\n"
+        f"  - reasoning_chain: ≤2 sentence chain of reasoning\n"
+        f"  - complexity_label: e.g. O(n), O(n²), O(n³)\n"
+        f"  - issues_found: list of performance issues"
     )
     report = await llm.with_structured_output(PerformanceReport).ainvoke(prompt)
     rd = report.model_dump()

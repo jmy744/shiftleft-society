@@ -1,27 +1,29 @@
 """
-ShiftLeft Society — FastAPI Gateway v2.2
+ShiftLeft Society — FastAPI Gateway v2.3
 SSE streaming via async job queues (POST /analyze/start → GET /analyze/stream/{run_id}).
 
-v2.2 fix:
-  - dialogue_history parser now extracts negotiation fields (position, budget_spent,
-    budget_remaining, gap_tiers, defend_cost) into a nego sub-object so the
-    Theatre replay budget widget renders correctly.
+v2.3 changes:
+  - Serves index.html at root URL so the whole app runs at one address.
+  - Same behaviour locally (http://localhost:8000) and in cloud (https://domain.tld).
+  - No more file:// dashboard — the API and the UI share an origin.
 """
 
 import asyncio, hashlib, hmac, json, os, sqlite3, subprocess, sys, time, uuid
+from pathlib import Path
 from typing import Dict
 
 import requests, uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import StreamingResponse, JSONResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import database as db
 from tribunal import tribunal_app
 from sarif_export import verdict_to_sarif
 
-app = FastAPI(title="ShiftLeft Society API", version="2.2")
+app = FastAPI(title="ShiftLeft Society API", version="2.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -73,14 +75,6 @@ def _role_from_sender(sender: str) -> str:
 
 
 def _parse_dialogue_item(m: dict) -> dict:
-    """
-    Tribunal stores each dialogue message as:
-      {"sender": "Security Auditor", "round": 1,
-       "content": "<JSON-stringified agent report>", "timestamp": "..."}
-
-    Unpacks the inner JSON, builds a clean message dict for the UI, AND extracts
-    negotiation fields into a 'nego' sub-object so the budget widget can render.
-    """
     sender = m.get("sender", m.get("agent", m.get("role", "unknown")))
     round_num = m.get("round", 1)
     timestamp = m.get("timestamp")
@@ -91,7 +85,7 @@ def _parse_dialogue_item(m: dict) -> dict:
     confidence = None
     message_type = "finding"
     display_parts = []
-    nego = None  # v2.2: extract negotiation data if present
+    nego = None
 
     parsed = None
     if isinstance(raw_content, str) and raw_content.strip().startswith("{"):
@@ -117,7 +111,6 @@ def _parse_dialogue_item(m: dict) -> dict:
         if parsed.get("verdict"):
             message_type = "verdict"
 
-        # Extract negotiation data if this looks like a Round 2 message
         position = parsed.get("position")
         if position in NEGO_POSITIONS:
             message_type = "negotiation"
@@ -136,7 +129,6 @@ def _parse_dialogue_item(m: dict) -> dict:
             display_parts.append(parsed["description"])
         if parsed.get("argument"):
             display_parts.append(parsed["argument"])
-        # Don't append "Position: ..." text — the nego widget shows it visually
         if not nego and parsed.get("position") and parsed.get("position") != "PARTIAL_AGREEMENT":
             display_parts.append(f"Position: {parsed['position']}")
         if parsed.get("conflict_resolution") and parsed["conflict_resolution"] != "No conflict detected.":
@@ -191,7 +183,7 @@ async def shutdown():
 # =====================================================================
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "ShiftLeft Society", "version": "2.2"}
+    return {"status": "ok", "service": "ShiftLeft Society", "version": "2.4"}
 
 @app.get("/alibaba-proof")
 async def alibaba_proof():
@@ -618,6 +610,19 @@ async def github_webhook(
 
     active_jobs.pop(run_id, None)
     return {"status": "analyzed", "pr": pr_num, "run_id": run_id}
+
+
+# =====================================================================
+# STATIC FRONTEND — serves index.html and any other static files at root
+# This MUST be defined LAST so it doesn't shadow the API routes above.
+# =====================================================================
+@app.get("/")
+async def serve_index():
+    index_path = Path("index.html")
+    if index_path.exists():
+        return FileResponse(index_path)
+    raise HTTPException(404, "index.html not found — make sure it's in the project root.")
+
 
 # =====================================================================
 if __name__ == "__main__":
