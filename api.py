@@ -554,6 +554,50 @@ def _format_comment(sec: dict, perf: dict, verdict: dict, conflict: bool, durati
         f"---\n> 🤖 *ShiftLeft Society | Qwen-Max on Alibaba Cloud ECS*"
     )
 
+async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: str, diff_url: str):
+    """
+    Runs the tribunal against a PR diff and posts the verdict as a PR comment.
+    Decoupled from the webhook HTTP response so GitHub's ~10s delivery timeout
+    never causes a 'failed delivery' even though the comment posts fine later.
+    """
+    diff_code = f"# PR #{pr_num}: {pr_title}"
+    if diff_url:
+        try:
+            hdrs = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+            diff_code = requests.get(diff_url, headers=hdrs, timeout=15).text[:8000]
+        except Exception as e:
+            print(f"[Webhook] diff fetch failed: {e}")
+
+    run_id = str(uuid.uuid4())
+    queue: asyncio.Queue = asyncio.Queue()
+    active_jobs[run_id] = queue
+    p = CodePayload(code=diff_code, filename=f"pr_{pr_num}.diff", issue_description=pr_body or pr_title)
+    asyncio.create_task(run_tribunal_task(run_id, p, queue))
+
+    result_ev = None
+    try:
+        while True:
+            ev = await asyncio.wait_for(queue.get(), timeout=180)
+            if ev.get("type") == "complete":
+                result_ev = ev; break
+            if ev.get("type") in ("error", "_sentinel", "timeout"):
+                break
+    except asyncio.TimeoutError:
+        print(f"[Webhook] PR #{pr_num} tribunal run timed out after 180s.")
+
+    if result_ev:
+        _post_pr_comment(repo, pr_num, _format_comment(
+            result_ev.get("security", {}), result_ev.get("performance", {}),
+            result_ev.get("verdict", {}), result_ev.get("conflict_detected", False),
+            result_ev.get("duration_seconds", 0),
+        ))
+        print(f"[Webhook] PR #{pr_num} comment posted. verdict={result_ev.get('verdict',{}).get('verdict')}")
+    else:
+        print(f"[Webhook] PR #{pr_num} produced no result — no comment posted.")
+
+    active_jobs.pop(run_id, None)
+
+
 @app.post("/webhook/github")
 async def github_webhook(
     request: Request,
@@ -570,46 +614,18 @@ async def github_webhook(
     if payload.get("action") not in ("opened", "synchronize"):
         return {"status": "ignored", "action": payload.get("action")}
 
-    pr      = payload.get("pull_request", {})
-    repo    = payload.get("repository", {}).get("full_name", "")
-    pr_num  = pr.get("number")
-    pr_body = pr.get("body", pr.get("title", ""))
+    pr       = payload.get("pull_request", {})
+    repo     = payload.get("repository", {}).get("full_name", "")
+    pr_num   = pr.get("number")
+    pr_title = pr.get("title", "")
+    pr_body  = pr.get("body", "")
     diff_url = pr.get("diff_url", "")
 
-    diff_code = f"# PR #{pr_num}: {pr.get('title','')}"
-    if diff_url:
-        try:
-            hdrs = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-            diff_code = requests.get(diff_url, headers=hdrs, timeout=15).text[:8000]
-        except Exception as e:
-            print(f"[Webhook] diff fetch failed: {e}")
+    # Respond to GitHub immediately — never block on the tribunal run.
+    # Processing + comment-posting continues in the background.
+    asyncio.create_task(_process_pr_webhook(repo, pr_num, pr_title, pr_body, diff_url))
 
-    run_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue()
-    active_jobs[run_id] = queue
-    p = CodePayload(code=diff_code, filename=f"pr_{pr_num}.diff", issue_description=pr_body)
-    asyncio.create_task(run_tribunal_task(run_id, p, queue))
-
-    result_ev = None
-    try:
-        while True:
-            ev = await asyncio.wait_for(queue.get(), timeout=180)
-            if ev.get("type") == "complete":
-                result_ev = ev; break
-            if ev.get("type") in ("error", "_sentinel", "timeout"):
-                break
-    except asyncio.TimeoutError:
-        pass
-
-    if result_ev:
-        _post_pr_comment(repo, pr_num, _format_comment(
-            result_ev.get("security", {}), result_ev.get("performance", {}),
-            result_ev.get("verdict", {}), result_ev.get("conflict_detected", False),
-            result_ev.get("duration_seconds", 0),
-        ))
-
-    active_jobs.pop(run_id, None)
-    return {"status": "analyzed", "pr": pr_num, "run_id": run_id}
+    return {"status": "accepted", "pr": pr_num}
 
 
 # =====================================================================
