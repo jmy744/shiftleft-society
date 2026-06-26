@@ -34,6 +34,19 @@ DB_PATH               = "tribunal_history.db"
 active_jobs: Dict[str, asyncio.Queue] = {}
 mcp_process = None
 
+# asyncio.create_task() only keeps a WEAK reference to the task internally.
+# If nothing else holds a strong reference, the task can be garbage-collected
+# mid-execution — a well-documented asyncio footgun. We keep created background
+# tasks here until they finish, then remove themselves via the done-callback.
+_background_tasks: set = set()
+
+def _spawn_background(coro):
+    """Create a task and keep a strong reference until it completes."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 AGENT_DISPLAY = {
     "security_auditor_r1":    "Security Auditor — Round 1",
     "performance_analyst_r1": "Performance Analyst — Round 1",
@@ -305,7 +318,7 @@ async def start_analysis(payload: CodePayload) -> dict:
     run_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
     active_jobs[run_id] = queue
-    asyncio.create_task(run_tribunal_task(run_id, payload, queue))
+    _spawn_background(run_tribunal_task(run_id, payload, queue))
     return {"run_id": run_id, "stream_url": f"/analyze/stream/{run_id}"}
 
 
@@ -572,7 +585,7 @@ async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: st
     queue: asyncio.Queue = asyncio.Queue()
     active_jobs[run_id] = queue
     p = CodePayload(code=diff_code, filename=f"pr_{pr_num}.diff", issue_description=pr_body or pr_title)
-    asyncio.create_task(run_tribunal_task(run_id, p, queue))
+    _spawn_background(run_tribunal_task(run_id, p, queue))
 
     result_ev = None
     try:
@@ -622,8 +635,9 @@ async def github_webhook(
     diff_url = pr.get("diff_url", "")
 
     # Respond to GitHub immediately — never block on the tribunal run.
-    # Processing + comment-posting continues in the background.
-    asyncio.create_task(_process_pr_webhook(repo, pr_num, pr_title, pr_body, diff_url))
+    # Processing + comment-posting continues in the background. Uses
+    # _spawn_background to prevent the task being garbage-collected mid-run.
+    _spawn_background(_process_pr_webhook(repo, pr_num, pr_title, pr_body, diff_url))
 
     return {"status": "accepted", "pr": pr_num}
 
