@@ -538,14 +538,23 @@ def _verify_sig(body: bytes, sig: str) -> bool:
     expected = "sha256=" + hmac.new(GITHUB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig or "")
 
-def _post_pr_comment(repo: str, pr_num: int, body: str):
+def _post_pr_comment(repo: str, pr_num: int, body: str) -> bool:
     if not GITHUB_TOKEN:
-        return
-    requests.post(
-        f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments",
-        headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"},
-        json={"body": body}, timeout=15,
-    )
+        print("[Webhook] No GITHUB_TOKEN set — cannot post PR comment.")
+        return False
+    try:
+        resp = requests.post(
+            f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments",
+            headers={"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"},
+            json={"body": body}, timeout=15,
+        )
+        if resp.status_code >= 300:
+            print(f"[Webhook] GitHub rejected comment: HTTP {resp.status_code} — {resp.text[:500]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[Webhook] Exception posting PR comment: {e}")
+        return False
 
 def _format_comment(sec: dict, perf: dict, verdict: dict, conflict: bool, duration: float) -> str:
     sev_e = {"CRITICAL": "🔴", "HIGH": "🟠", "LOW": "🟡", "SAFE": "🟢"}
@@ -605,12 +614,13 @@ async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: st
         print(f"[Webhook] PR #{pr_num} tribunal run timed out after 180s.")
 
     if result_ev:
-        await asyncio.to_thread(_post_pr_comment, repo, pr_num, _format_comment(
+        posted = await asyncio.to_thread(_post_pr_comment, repo, pr_num, _format_comment(
             result_ev.get("security", {}), result_ev.get("performance", {}),
             result_ev.get("verdict", {}), result_ev.get("conflict_detected", False),
             result_ev.get("duration_seconds", 0),
         ))
-        print(f"[Webhook] PR #{pr_num} comment posted. verdict={result_ev.get('verdict',{}).get('verdict')}")
+        status = "comment posted" if posted else "comment FAILED to post (see above)"
+        print(f"[Webhook] PR #{pr_num} {status}. verdict={result_ev.get('verdict',{}).get('verdict')}")
     else:
         print(f"[Webhook] PR #{pr_num} produced no result — no comment posted.")
 
