@@ -577,7 +577,13 @@ async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: st
     if diff_url:
         try:
             hdrs = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-            diff_code = requests.get(diff_url, headers=hdrs, timeout=15).text[:8000]
+            # requests.get() is BLOCKING — run it in a thread so it never
+            # freezes the single-threaded asyncio event loop. Without this,
+            # a slow diff fetch can stall the whole app, including sending
+            # GitHub's webhook response, causing GitHub to report a
+            # "timed out" delivery even though our handler already returned.
+            resp = await asyncio.to_thread(requests.get, diff_url, headers=hdrs, timeout=15)
+            diff_code = resp.text[:8000]
         except Exception as e:
             print(f"[Webhook] diff fetch failed: {e}")
 
@@ -599,7 +605,7 @@ async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: st
         print(f"[Webhook] PR #{pr_num} tribunal run timed out after 180s.")
 
     if result_ev:
-        _post_pr_comment(repo, pr_num, _format_comment(
+        await asyncio.to_thread(_post_pr_comment, repo, pr_num, _format_comment(
             result_ev.get("security", {}), result_ev.get("performance", {}),
             result_ev.get("verdict", {}), result_ev.get("conflict_detected", False),
             result_ev.get("duration_seconds", 0),
