@@ -567,8 +567,9 @@ def _format_comment(
     mcp_verified: bool = False,
 ) -> str:
     """
-    Production-style PR comment: shields.io badges, collapsible negotiation
-    transcript, MCP attestation, and Alibaba Cloud deployment footer.
+    Production-style PR comment. Visual restraint modeled on
+    CodeQL / Snyk / Sonar bot comments: no decorative emoji on headings,
+    shields.io badges carry visual weight, all detail in a collapsible block.
     """
     LIVE_URL = "https://shiftleft-society.duckdns.org"
     REGION   = "Alibaba Cloud ECS · Singapore"
@@ -590,23 +591,23 @@ def _format_comment(
     perf_sev  = (perf.get("severity") or "N/A").upper()
 
     header_badges = " ".join([
-        _badge("Tribunal", "v2.4", "0A0A0A"),
-        _badge("Verdict", v, verdict_color),
-        _badge("Duration", f"{duration:.1f}s", "1976D2"),
+        _badge("tribunal", "v2.4", "0A0A0A"),
+        _badge("verdict", v, verdict_color),
+        _badge("duration", f"{duration:.1f}s", "1976D2"),
         _badge("MCP", "verified" if mcp_verified else "fallback", "2E7D32" if mcp_verified else "F57C00"),
     ])
 
     secrets_block = ""
     if sec.get("secrets_found"):
         secrets_block = (
-            f"\n> 🚨 **SECRETS DETECTED** — rotate immediately: "
+            f"\n> **Secrets detected** — rotate immediately: "
             f"`{'`, `'.join(sec.get('secrets_found', []))}`\n"
         )
 
     conflict_block = ""
     if conflict:
         conflict_block = (
-            f"\n> ⚖️ **Round 1 conflict resolved** — {verdict.get('conflict_resolution','')}\n"
+            f"\n> **Round 1 conflict resolved.** {verdict.get('conflict_resolution','')}\n"
         )
 
     findings = "\n".join(f"- {f}" for f in verdict.get("key_findings", [])) or "- (none reported)"
@@ -615,21 +616,21 @@ def _format_comment(
     if conflict and (sec_r2 or perf_r2):
         sec_r2  = sec_r2  or {}
         perf_r2 = perf_r2 or {}
-        sec_pos   = sec_r2.get("position", "?")
-        sec_spent = sec_r2.get("budget_spent", "?")
-        sec_arg   = (sec_r2.get("argument") or "").strip()
+        sec_pos    = sec_r2.get("position", "?")
+        sec_spent  = sec_r2.get("budget_spent", "?")
+        sec_arg    = (sec_r2.get("argument") or "").strip()
         perf_pos   = perf_r2.get("position", "?")
         perf_spent = perf_r2.get("budget_spent", "?")
         perf_arg   = (perf_r2.get("argument") or "").strip()
         negotiation_block = (
             "\n<details>\n"
-            "<summary><b>📜 Negotiation transcript — confidence-budget Round 2</b></summary>\n\n"
+            "<summary><b>Negotiation transcript — confidence-budget Round 2</b></summary>\n\n"
             "Each agent has a 100-point confidence budget. "
-            "DEFEND costs `gap_tiers × 30`; PARTIAL costs 15; CONCEDE costs 0. "
+            "`DEFEND` costs `gap_tiers × 30`; `PARTIAL` costs 15; `CONCEDE` costs 0. "
             "The LLM picks the categorical position; deterministic Python computes the consequence.\n\n"
-            f"**🛡️ Security Auditor — {sec_pos}** _(spent {sec_spent}/100)_\n"
+            f"**Security Auditor — `{sec_pos}`** &nbsp;·&nbsp; spent {sec_spent}/100\n"
             f"> {sec_arg}\n\n"
-            f"**⚡ Performance Analyst — {perf_pos}** _(spent {perf_spent}/100)_\n"
+            f"**Performance Analyst — `{perf_pos}`** &nbsp;·&nbsp; spent {perf_spent}/100\n"
             f"> {perf_arg}\n"
             "</details>\n"
         )
@@ -638,25 +639,23 @@ def _format_comment(
 
     return (
         f"<!-- shiftleft-society-bot -->\n"
-        f"## 🏛️ ShiftLeft Society — DevSecOps Tribunal\n"
-        f"_Multi-agent code review with confidence-budget negotiation_\n\n"
+        f"## ShiftLeft Society — DevSecOps Tribunal\n"
+        f"_Multi-agent code review with confidence-budget negotiation._\n\n"
         f"{header_badges}\n"
         f"{secrets_block}{conflict_block}\n"
         f"---\n\n"
-        f"### 🛡️ Security Auditor &nbsp; {_badge('severity', sec_sev, sev_color.get(sec_sev, '9E9E9E'))}\n"
-        f"**{sec.get('title','(no title)')}**\n\n"
-        f"{sec.get('description','(no description)')}\n\n"
-        f"### ⚡ Performance Analyst &nbsp; {_badge('severity', perf_sev, sev_color.get(perf_sev, '9E9E9E'))}\n"
-        f"**{perf.get('title','(no title)')}**\n\n"
-        f"{perf.get('description','(no description)')}\n"
+        f"**Security Auditor** &nbsp; {_badge('severity', sec_sev, sev_color.get(sec_sev, '9E9E9E'))}\n\n"
+        f"{sec.get('title','(no title)')} — {sec.get('description','(no description)')}\n\n"
+        f"**Performance Analyst** &nbsp; {_badge('severity', perf_sev, sev_color.get(perf_sev, '9E9E9E'))}\n\n"
+        f"{perf.get('title','(no title)')} — {perf.get('description','(no description)')}\n"
         f"{negotiation_block}\n"
-        f"### 🔍 Mediator’s Key Findings\n{findings}\n\n"
-        f"### 📋 Suggested Remediation\n```python\n{remediation}\n```\n\n"
+        f"**Mediator’s key findings**\n{findings}\n\n"
+        f"**Suggested remediation**\n```python\n{remediation}\n```\n\n"
         f"---\n"
         f"<sub>"
-        f"🤖 <b>ShiftLeft Society</b> · "
-        f"<a href=\"{LIVE_URL}\">View full analysis dashboard →</a> · "
-        f"Powered by <b>Qwen-Max</b> on <b>{REGION}</b>"
+        f"🤖 ShiftLeft Society · "
+        f"<a href=\"{LIVE_URL}\">view full analysis dashboard →</a> · "
+        f"Qwen-Max on {REGION}"
         f"</sub>"
     )
 
