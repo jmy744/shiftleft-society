@@ -145,7 +145,7 @@ python benchmark.py
                   └─────────────────┘
 ```
 
-*A formal architecture diagram is available at [`docs/architecture.png`](docs/architecture.png).*
+![ShiftLeft Society Architecture](docs/architecture.png)
 
 ### Request lifecycle
 
