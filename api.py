@@ -635,7 +635,8 @@ def _format_comment(
             rate  = cred.get("win_rate", 0.5)
             bonus = cred.get("bonus", 0)
             sign  = "+" if bonus >= 0 else ""
-            return f"track record: {rate:.0%} upheld over {total} past negotiations → budget {sign}{bonus}"
+            noun = "negotiation" if total == 1 else "negotiations"
+            return f"track record: {rate:.0%} upheld over {total} past {noun} → budget {sign}{bonus}"
 
         negotiation_block = (
             "\n<details>\n"
