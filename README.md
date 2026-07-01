@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🏛️ ShiftLeft Society
+# ShiftLeft Society
 ### Multi-agent DevSecOps tribunal with confidence-budget negotiation
 
 **Every pull request gets a security review and a performance review in under 10 seconds.
@@ -13,7 +13,7 @@ The agents argue on the record. The arguments are auditable. The verdict is repr
 [![Powered by](https://img.shields.io/badge/powered%20by-Qwen--Max-2E7D32)](https://www.alibabacloud.com/help/en/model-studio)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org)
 
-**🔗 Live demo:** **<https://shiftleft-society.duckdns.org>** — open it on your phone. It works.
+**🔗 Live demo:** **<https://shiftleft-society.duckdns.org>** - open it on your phone. It works.
 
 </div>
 
@@ -25,7 +25,7 @@ Every engineering team reviews pull requests. Reviewers are expensive, slow, and
 
 > **A single AI voice making a single judgment.** No mechanism for disagreement. No cost to being wrong. No transcript to audit.
 
-A security tool that calls everything CRITICAL is useless. A performance tool that calls everything HIGH is useless. **The signal-to-noise problem isn't solved by adding more AI — it's solved by giving AIs adversarial roles that have to negotiate with each other before issuing a verdict.**
+A security tool that calls everything CRITICAL is useless. A performance tool that calls everything HIGH is useless. **The signal-to-noise problem isn't solved by adding more AI - it's solved by giving AIs adversarial roles that have to negotiate with each other before issuing a verdict.**
 
 ShiftLeft Society is a multi-agent tribunal that does exactly that.
 
@@ -37,7 +37,7 @@ ShiftLeft Society is a multi-agent tribunal that does exactly that.
 
 This is the design principle that makes everything else work.
 
-Most "multi-agent negotiation" systems let the LLM compute the consequences of its own choices — it picks a stance, then talks itself into being more or less confident. Same input → different output every run. Unauditable.
+Most "multi-agent negotiation" systems let the LLM compute the consequences of its own choices - it picks a stance, then talks itself into being more or less confident. Same input → different output every run. Unauditable.
 
 ShiftLeft Society inverts that. The LLM only chooses a **categorical position** from a fixed set:
 
@@ -47,7 +47,7 @@ ShiftLeft Society inverts that. The LLM only chooses a **categorical position** 
 | `PARTIAL` | Adjust toward the other agent | `15` budget |
 | `CONCEDE` | Match the other agent | `0` budget |
 
-Once the LLM picks one of those three labels, **deterministic Python computes everything else** — the new severity tier, the budget deduction, the remaining negotiation capacity, the next-round eligibility. The LLM never touches a number.
+Once the LLM picks one of those three labels, **deterministic Python computes everything else** - the new severity tier, the budget deduction, the remaining negotiation capacity, the next-round eligibility. The LLM never touches a number.
 
 This separation has three properties production systems need but most agent demos lack:
 
@@ -105,11 +105,15 @@ python benchmark.py
 
 |  | Typical AI code-review bot | Other multi-agent demos | **ShiftLeft Society** |
 |---|---|---|---|
-| Number of perspectives | 1 | 2–3 | 2 + mediator |
+| Number of perspectives | 1 | 2-3 | 2 + mediator |
 | Mechanism for disagreement | None | Discussion / voting | **Confidence-budget negotiation** |
 | Cost of being wrong | None | None | **Budget points** |
+
 | Memory across runs | None | None | **Cross-PR credibility — track record adjusts future budget** |
 | Transcript | No | Sometimes | **Always — auditable, replayable** |
+=======
+| Transcript | No | Sometimes | **Always - auditable, replayable** |
+
 | Output format | Custom JSON | Custom JSON | **SARIF 2.1.0 + CycloneDX SBOM** (industry standards) |
 | Failure handling | Crashes or returns null | LLM retry | **4-layer fallback chain** (see below) |
 | Live deployment | Varies | Usually localhost demo | **Public HTTPS, Alibaba Cloud Singapore** |
@@ -165,12 +169,12 @@ python benchmark.py
 
 ### Request lifecycle
 
-1. **Trigger** — dashboard `POST /analyze/start`, or GitHub webhook `POST /webhook/github`
+1. **Trigger** - dashboard `POST /analyze/start`, or GitHub webhook `POST /webhook/github`
 2. **Round 1 (parallel fan-out via LangGraph Send API)** — Security Auditor and Performance Analyst analyze the code simultaneously, each calling Qwen-Max via Alibaba Cloud's DashScope endpoint and invoking MCP tools where relevant
-3. **Merge & gap check** — deterministic Python compares severity tiers; gap ≥ 1 triggers Round 2
-4. **Round 2 (confidence-budget negotiation)** — each agent picks `DEFEND` / `PARTIAL` / `CONCEDE`, Python computes the cost and new severity
-5. **Mediator synthesis** — Qwen-Max in a structured-output mode generates the final verdict with key findings and remediation code
-6. **Persistence + delivery** — SQLite record, optional SARIF/SBOM export, PR comment posted via GitHub API if triggered from a webhook
+3. **Merge & gap check** - deterministic Python compares severity tiers; gap ≥ 1 triggers Round 2
+4. **Round 2 (confidence-budget negotiation)** - each agent picks `DEFEND` / `PARTIAL` / `CONCEDE`, Python computes the cost and new severity
+5. **Mediator synthesis** - Qwen-Max in a structured-output mode generates the final verdict with key findings and remediation code
+6. **Persistence + delivery** - SQLite record, optional SARIF/SBOM export, PR comment posted via GitHub API if triggered from a webhook
 
 ---
 
@@ -178,7 +182,7 @@ python benchmark.py
 
 The substance under the hood. Each item below addresses a specific failure mode observed in production AI systems.
 
-### Mediator never crashes — 4-layer fallback chain
+### Mediator never crashes - 4-layer fallback chain
 
 ```
 Layer 1: with_structured_output (LangChain Pydantic parsing)
@@ -210,8 +214,8 @@ These are the kinds of issues you only find under real production load. They're 
 
 ### Output is industry-standard, not custom
 
-- **SARIF 2.1.0** — the security-scanning interchange format used by GitHub Code Scanning, Microsoft Defender, Snyk. Schema-valid output means tribunal verdicts can be imported into any SARIF-aware tooling.
-- **CycloneDX SBOM** — software bill of materials in the same format used by enterprise compliance tooling.
+- **SARIF 2.1.0** - the security-scanning interchange format used by GitHub Code Scanning, Microsoft Defender, Snyk. Schema-valid output means tribunal verdicts can be imported into any SARIF-aware tooling.
+- **CycloneDX SBOM** - software bill of materials in the same format used by enterprise compliance tooling.
 
 ### Webhook handler is decoupled from processing
 
@@ -338,13 +342,13 @@ This project addresses Track 3's stated rubric directly:
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Free to fork, use, modify, and deploy.
+MIT - see [LICENSE](LICENSE). Free to fork, use, modify, and deploy.
 
 ---
 
 <div align="center">
 
-**Built for the Qwen Cloud Global AI Hackathon · Track 3: Agent Society**
+
 
 [Live demo](https://shiftleft-society.duckdns.org) · [Open a test PR](https://github.com/jmy744/shiftleft-society/pulls) · [Read the benchmark](benchmark_results.json)
 
