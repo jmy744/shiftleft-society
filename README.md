@@ -55,6 +55,21 @@ This separation has three properties production systems need but most agent demo
 2. **Reproducible.** Same inputs produce the same negotiated outcome, regardless of LLM temperature.
 3. **Defensible.** The mediator's final verdict is derived from a budget-weighted state, not from "vibes" — and it falls back to deterministic severity-tier rules if the LLM output is malformed.
 
+### The negotiation has memory across every PR it has ever seen
+
+A single-PR negotiation is only half the idea. The other half: **agents that have historically been right start future negotiations with a larger budget; agents that have been overruled more often start with less.**
+
+After every Mediator verdict, each agent's Round 2 position is scored — did its post-negotiation severity match the one that actually drove the final call? That outcome is written to a persistent `agent_credibility` table (`migrate_v4.py`), Bayesian-smoothed against a 5-negotiation neutral prior so a single early win or loss can't swing anything, and capped at ±15 budget points so no agent can ever fully dominate or be silenced. The next time that agent negotiates — on a completely different PR, days later — it starts from `100 + track_record_adjustment`, not a fresh 100 every time.
+
+```
+effective_budget = 100 + clamp(-15, +15, round((smoothed_win_rate - 0.5) × 30))
+smoothed_win_rate = (wins + 2.5) / (total_negotiations + 5)
+```
+
+This turns the tribunal from a system that negotiates well **once** into a system that gets better at knowing which of its own voices to trust **over time** — without any human manually re-weighting anything. It's visible directly in the PR comment's negotiation transcript: *"track record: 75% upheld over 12 past negotiations → budget +8."*
+
+All credibility reads/writes are wrapped in `asyncio.to_thread` and fail closed to a neutral bonus — the same blocking-call discipline documented below, applied consistently rather than as a one-off fix.
+
 ---
 
 ## See it in action
@@ -93,6 +108,7 @@ python benchmark.py
 | Number of perspectives | 1 | 2–3 | 2 + mediator |
 | Mechanism for disagreement | None | Discussion / voting | **Confidence-budget negotiation** |
 | Cost of being wrong | None | None | **Budget points** |
+| Memory across runs | None | None | **Cross-PR credibility — track record adjusts future budget** |
 | Transcript | No | Sometimes | **Always — auditable, replayable** |
 | Output format | Custom JSON | Custom JSON | **SARIF 2.1.0 + CycloneDX SBOM** (industry standards) |
 | Failure handling | Crashes or returns null | LLM retry | **4-layer fallback chain** (see below) |
@@ -145,7 +161,7 @@ python benchmark.py
                   └─────────────────┘
 ```
 
-![ShiftLeft Society Architecture](docs/architecture.png)
+*A formal architecture diagram is available at [`docs/architecture.png`](docs/architecture.png).*
 
 ### Request lifecycle
 
@@ -289,9 +305,11 @@ Push a PR. The tribunal will comment within ~15 seconds.
 shiftleft-society/
 ├── api.py               # FastAPI gateway: REST + SSE + GitHub webhook
 ├── tribunal.py          # LangGraph agent society + confidence-budget negotiation
+├── credibility.py       # Cross-PR agent trust tracking (Bayesian-smoothed budget bonus)
 ├── mcp_server.py        # FastMCP security toolserver (port 8001)
 ├── database.py          # SQLite persistence layer
 ├── migrate_v3.py        # Idempotent schema migrations
+├── migrate_v4.py        # Adds agent_credibility table
 ├── benchmark.py         # 20-case tribunal vs baseline benchmark
 ├── baseline.py          # Single-agent baseline for comparison
 ├── sarif_export.py      # SARIF 2.1.0 exporter

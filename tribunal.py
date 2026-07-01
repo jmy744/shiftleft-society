@@ -25,6 +25,8 @@ from langgraph.types import Send
 from mcp.client.streamable_http import streamablehttp_client
 from mcp import ClientSession
 
+import credibility
+
 # =====================================================================
 # 1. CONFIGURATION
 # =====================================================================
@@ -288,7 +290,7 @@ def _tier(severity: str) -> int:
 def _sev_name(tier: int) -> str:
     return TIER_NAMES.get(max(0, min(3, tier)), "UNKNOWN")
 
-def _compute_negotiation(my_severity: str, other_severity: str, position: str) -> dict:
+def _compute_negotiation(my_severity: str, other_severity: str, position: str, budget: int = INITIAL_BUDGET) -> dict:
     my_t    = _tier(my_severity)
     other_t = _tier(other_severity)
     gap     = abs(my_t - other_t)
@@ -304,16 +306,17 @@ def _compute_negotiation(my_severity: str, other_severity: str, position: str) -
         revised = other_severity.upper()
         spent   = COST_CONCEDE
 
-    if spent > INITIAL_BUDGET:
+    if spent > budget:
         revised = other_severity.upper()
-        spent   = INITIAL_BUDGET
+        spent   = budget
         position = "CONCEDE"
 
     return {
         "position":         position,
         "revised_severity": revised,
         "budget_spent":     spent,
-        "budget_remaining": INITIAL_BUDGET - spent,
+        "budget_total":     budget,
+        "budget_remaining": budget - spent,
         "gap_tiers":        gap,
         "defend_cost":      gap * COST_PER_TIER,
     }
@@ -567,9 +570,15 @@ async def security_debates(state: TribunalState) -> dict:
     other_sev = state["performance_severity"]
     gap       = state.get("severity_gap", 1)
     defend_cost = gap * COST_PER_TIER
+
+    cred = await credibility.get_budget_bonus("security_auditor")
+    effective_budget = max(0, INITIAL_BUDGET + cred["bonus"])
+
     prompt = (
         f"Security Auditor — Round 2.\n"
-        f"Confidence budget: {INITIAL_BUDGET}.\n"
+        f"Confidence budget: {effective_budget} "
+        f"(base {INITIAL_BUDGET}, track-record adjustment {cred['bonus']:+d} "
+        f"from {cred['total']} past negotiations, {cred['win_rate']:.0%} upheld).\n"
         f"Your R1: {my_sev} | Other: {other_sev} | Gap: {gap} tier(s)\n"
         f"Positions: DEFEND (cost {defend_cost}) | PARTIAL (cost {COST_PARTIAL}) | CONCEDE (cost {COST_CONCEDE}).\n"
         f"YOUR R1 REPORT: {json.dumps(state['security_r1'], indent=2)}\n"
@@ -579,14 +588,16 @@ async def security_debates(state: TribunalState) -> dict:
     )
     resp = await llm.with_structured_output(DebateResponse).ainvoke(prompt)
     rd = resp.model_dump()
-    nego = _compute_negotiation(my_sev, other_sev, rd["position"])
+    nego = _compute_negotiation(my_sev, other_sev, rd["position"], budget=effective_budget)
     rd.update(nego)
     rd["role"] = "security_r2"
+    rd["credibility"] = cred
     msg: AgentMessage = {
         "sender": "Security Auditor (Round 2)", "round": 2,
         "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-    print(f"[Security R2] {rd['position']} → {rd['revised_severity']} (spent {rd['budget_spent']}/{INITIAL_BUDGET})")
+    print(f"[Security R2] {rd['position']} → {rd['revised_severity']} "
+          f"(spent {rd['budget_spent']}/{effective_budget}, trust={cred['win_rate']:.0%})")
     return {"round2_responses": [rd], "dialogue_history": [msg]}
 
 async def performance_debates(state: TribunalState) -> dict:
@@ -595,9 +606,15 @@ async def performance_debates(state: TribunalState) -> dict:
     other_sev = state["security_severity"]
     gap       = state.get("severity_gap", 1)
     defend_cost = gap * COST_PER_TIER
+
+    cred = await credibility.get_budget_bonus("performance_analyst")
+    effective_budget = max(0, INITIAL_BUDGET + cred["bonus"])
+
     prompt = (
         f"Performance Analyst — Round 2.\n"
-        f"Confidence budget: {INITIAL_BUDGET}.\n"
+        f"Confidence budget: {effective_budget} "
+        f"(base {INITIAL_BUDGET}, track-record adjustment {cred['bonus']:+d} "
+        f"from {cred['total']} past negotiations, {cred['win_rate']:.0%} upheld).\n"
         f"Your R1: {my_sev} | Other: {other_sev} | Gap: {gap} tier(s)\n"
         f"Positions: DEFEND (cost {defend_cost}) | PARTIAL (cost {COST_PARTIAL}) | CONCEDE (cost {COST_CONCEDE}).\n"
         f"YOUR R1 REPORT: {json.dumps(state['performance_r1'], indent=2)}\n"
@@ -607,14 +624,16 @@ async def performance_debates(state: TribunalState) -> dict:
     )
     resp = await llm.with_structured_output(DebateResponse).ainvoke(prompt)
     rd = resp.model_dump()
-    nego = _compute_negotiation(my_sev, other_sev, rd["position"])
+    nego = _compute_negotiation(my_sev, other_sev, rd["position"], budget=effective_budget)
     rd.update(nego)
     rd["role"] = "performance_r2"
+    rd["credibility"] = cred
     msg: AgentMessage = {
         "sender": "Performance Analyst (Round 2)", "round": 2,
         "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-    print(f"[Performance R2] {rd['position']} → {rd['revised_severity']} (spent {rd['budget_spent']}/{INITIAL_BUDGET})")
+    print(f"[Performance R2] {rd['position']} → {rd['revised_severity']} "
+          f"(spent {rd['budget_spent']}/{effective_budget}, trust={cred['win_rate']:.0%})")
     return {"round2_responses": [rd], "dialogue_history": [msg]}
 
 def merge_round2(state: TribunalState) -> dict:
@@ -689,6 +708,27 @@ async def lead_mediator(state: TribunalState) -> dict:
 
     if vd.get("verdict") == "APPROVE":
         vd["sbom"] = _generate_sbom(state["code"], state["filename"], state["run_id"])
+
+    # --- Cross-PR credibility: record whether each agent's Round 2 position was upheld ---
+    if state.get("conflict_detected"):
+        sec_r2  = state.get("security_r2",  {})
+        perf_r2 = state.get("performance_r2", {})
+        negotiated = []
+        if sec_r2.get("revised_severity"):  negotiated.append(sec_r2["revised_severity"])
+        if perf_r2.get("revised_severity"): negotiated.append(perf_r2["revised_severity"])
+        if negotiated:
+            highest_tier = max(_tier(s) for s in negotiated)
+            try:
+                if sec_r2.get("revised_severity"):
+                    await credibility.record_outcome(
+                        "security_auditor", _tier(sec_r2["revised_severity"]) == highest_tier
+                    )
+                if perf_r2.get("revised_severity"):
+                    await credibility.record_outcome(
+                        "performance_analyst", _tier(perf_r2["revised_severity"]) == highest_tier
+                    )
+            except Exception as e:
+                print(f"[Lead Mediator] credibility recording failed (non-fatal): {e}")
 
     msg: AgentMessage = {
         "sender": "Lead Mediator", "round": 3,

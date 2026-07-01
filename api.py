@@ -618,20 +618,40 @@ def _format_comment(
         perf_r2 = perf_r2 or {}
         sec_pos    = sec_r2.get("position", "?")
         sec_spent  = sec_r2.get("budget_spent", "?")
+        sec_total  = sec_r2.get("budget_total", 100)
         sec_arg    = (sec_r2.get("argument") or "").strip()
         perf_pos   = perf_r2.get("position", "?")
         perf_spent = perf_r2.get("budget_spent", "?")
+        perf_total = perf_r2.get("budget_total", 100)
         perf_arg   = (perf_r2.get("argument") or "").strip()
+
+        sec_cred  = sec_r2.get("credibility") or {}
+        perf_cred = perf_r2.get("credibility") or {}
+
+        def _trust_line(cred: dict) -> str:
+            total = cred.get("total", 0)
+            if not total:
+                return "_no track record yet — neutral budget_"
+            rate  = cred.get("win_rate", 0.5)
+            bonus = cred.get("bonus", 0)
+            sign  = "+" if bonus >= 0 else ""
+            return f"track record: {rate:.0%} upheld over {total} past negotiations → budget {sign}{bonus}"
+
         negotiation_block = (
             "\n<details>\n"
             "<summary><b>Negotiation transcript — confidence-budget Round 2</b></summary>\n\n"
-            "Each agent has a 100-point confidence budget. "
+            "Each agent starts from a 100-point confidence budget, adjusted by its own "
+            "cross-PR track record (an agent that's been overruled more often starts with less; "
+            "one that's usually been right starts with more — capped at ±15). "
             "`DEFEND` costs `gap_tiers × 30`; `PARTIAL` costs 15; `CONCEDE` costs 0. "
-            "The LLM picks the categorical position; deterministic Python computes the consequence.\n\n"
-            f"**Security Auditor — `{sec_pos}`** &nbsp;·&nbsp; spent {sec_spent}/100\n"
-            f"> {sec_arg}\n\n"
-            f"**Performance Analyst — `{perf_pos}`** &nbsp;·&nbsp; spent {perf_spent}/100\n"
+            "The LLM picks the categorical position; deterministic Python computes the consequence "
+            "and updates the agent's track record after the verdict.\n\n"
+            f"**Security Auditor — `{sec_pos}`** &nbsp;·&nbsp; spent {sec_spent}/{sec_total}\n"
+            f"> {sec_arg}\n"
+            f"> *{_trust_line(sec_cred)}*\n\n"
+            f"**Performance Analyst — `{perf_pos}`** &nbsp;·&nbsp; spent {perf_spent}/{perf_total}\n"
             f"> {perf_arg}\n"
+            f"> *{_trust_line(perf_cred)}*\n"
             "</details>\n"
         )
 
