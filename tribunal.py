@@ -1,14 +1,6 @@
 """
-ShiftLeft Society — LangGraph Agent Society
-Track 3: Agent Society | Qwen Cloud Hackathon 2026
-
-v2.4 — BULLETPROOF MEDIATOR
-  - Mediator uses raw ainvoke (not with_structured_output) to prevent
-    Qwen-Max runaway-token bug that kept hitting 8192-token ceiling.
-  - Robust JSON parsing with regex fallback.
-  - Severity-based verdict inference if mediator output is garbage.
-  - mediator_llm capped at 3000 max_tokens (separate instance).
-  - Nested-loop detection added to MCP fallback (fixes TC10).
+ShiftLeft Society: LangGraph Agent Society
+Track 3: Agent Society
 """
 
 import os
@@ -709,24 +701,47 @@ async def lead_mediator(state: TribunalState) -> dict:
     if vd.get("verdict") == "APPROVE":
         vd["sbom"] = _generate_sbom(state["code"], state["filename"], state["run_id"])
 
-    # --- Cross-PR credibility: record whether each agent's Round 2 position was upheld ---
+    # --- Cross-PR credibility: record whether each agent's Round 2 judgment was sound ---
+    #
+    # An agent's judgment is "sound" (a win) if EITHER:
+    #   (a) it held a position matching the final driving (highest) severity, OR
+    #   (b) it DEFERRED (PARTIAL / CONCEDE) to a peer flagging an equal-or-higher
+    #       severity — deferring to a more serious, valid concern is good judgment.
+    #
+    # An agent only LOSES if it DEFENDED a position that did not end up driving the
+    # verdict — i.e. it dug in on its own severity and was overruled by a higher one.
+    #
+    # This corrects the earlier metric, which punished an agent simply for conceding
+    # to a higher-severity peer even when that concession was the correct call.
     if state.get("conflict_detected"):
         sec_r2  = state.get("security_r2",  {})
         perf_r2 = state.get("performance_r2", {})
         negotiated = []
         if sec_r2.get("revised_severity"):  negotiated.append(sec_r2["revised_severity"])
         if perf_r2.get("revised_severity"): negotiated.append(perf_r2["revised_severity"])
+
         if negotiated:
             highest_tier = max(_tier(s) for s in negotiated)
+
+            def _judgment_sound(r2: dict) -> bool:
+                sev = r2.get("revised_severity")
+                if not sev:
+                    return False
+                position = (r2.get("position") or "").upper()
+                # (a) held the driving severity
+                if _tier(sev) == highest_tier:
+                    return True
+                # (b) deferred (PARTIAL/CONCEDE) to a higher-severity peer — correct deference
+                if position in ("PARTIAL", "CONCEDE"):
+                    return True
+                # otherwise: DEFENDED a non-driving severity, or other → overruled
+                return False
+
             try:
                 if sec_r2.get("revised_severity"):
-                    await credibility.record_outcome(
-                        "security_auditor", _tier(sec_r2["revised_severity"]) == highest_tier
-                    )
+                    await credibility.record_outcome("security_auditor", _judgment_sound(sec_r2))
                 if perf_r2.get("revised_severity"):
-                    await credibility.record_outcome(
-                        "performance_analyst", _tier(perf_r2["revised_severity"]) == highest_tier
-                    )
+                    await credibility.record_outcome("performance_analyst", _judgment_sound(perf_r2))
             except Exception as e:
                 print(f"[Lead Mediator] credibility recording failed (non-fatal): {e}")
 
