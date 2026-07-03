@@ -1,6 +1,14 @@
 """
-ShiftLeft Society: LangGraph Agent Society
-Track 3: Agent Society
+ShiftLeft Society — LangGraph Agent Society
+Track 3: Agent Society | Qwen Cloud Hackathon 2026
+
+v2.4 — BULLETPROOF MEDIATOR
+  - Mediator uses raw ainvoke (not with_structured_output) to prevent
+    Qwen-Max runaway-token bug that kept hitting 8192-token ceiling.
+  - Robust JSON parsing with regex fallback.
+  - Severity-based verdict inference if mediator output is garbage.
+  - mediator_llm capped at 3000 max_tokens (separate instance).
+  - Nested-loop detection added to MCP fallback (fixes TC10).
 """
 
 import os
