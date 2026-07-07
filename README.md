@@ -1,6 +1,6 @@
 <div align="center">
 
-# ShiftLeft Society
+# 🏛️ ShiftLeft Society
 ### Multi-agent DevSecOps tribunal with confidence-budget negotiation
 
 **Every pull request gets a security review and a performance review in under 10 seconds.
@@ -13,7 +13,7 @@ The agents argue on the record. The arguments are auditable. The verdict is repr
 [![Powered by](https://img.shields.io/badge/powered%20by-Qwen--Max-2E7D32)](https://www.alibabacloud.com/help/en/model-studio)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org)
 
-**🔗 Live demo:** **<https://shiftleft-society.duckdns.org>** - open it on your phone. It works.
+**🔗 Live demo:** **<https://shiftleft-society.duckdns.org>**: open it on your phone. It works.
 
 </div>
 
@@ -25,7 +25,7 @@ Every engineering team reviews pull requests. Reviewers are expensive, slow, and
 
 > **A single AI voice making a single judgment.** No mechanism for disagreement. No cost to being wrong. No transcript to audit.
 
-A security tool that calls everything CRITICAL is useless. A performance tool that calls everything HIGH is useless. **The signal-to-noise problem isn't solved by adding more AI - it's solved by giving AIs adversarial roles that have to negotiate with each other before issuing a verdict.**
+A security tool that calls everything CRITICAL is useless. A performance tool that calls everything HIGH is useless. **The signal-to-noise problem isn't solved by adding more AI, it's solved by giving AIs adversarial roles that have to negotiate with each other before issuing a verdict.**
 
 ShiftLeft Society is a multi-agent tribunal that does exactly that.
 
@@ -37,7 +37,7 @@ ShiftLeft Society is a multi-agent tribunal that does exactly that.
 
 This is the design principle that makes everything else work.
 
-Most "multi-agent negotiation" systems let the LLM compute the consequences of its own choices - it picks a stance, then talks itself into being more or less confident. Same input → different output every run. Unauditable.
+Most "multi-agent negotiation" systems let the LLM compute the consequences of its own choices, it picks a stance, then talks itself into being more or less confident. Same input → different output every run. Unauditable.
 
 ShiftLeft Society inverts that. The LLM only chooses a **categorical position** from a fixed set:
 
@@ -47,28 +47,28 @@ ShiftLeft Society inverts that. The LLM only chooses a **categorical position** 
 | `PARTIAL` | Adjust toward the other agent | `15` budget |
 | `CONCEDE` | Match the other agent | `0` budget |
 
-Once the LLM picks one of those three labels, **deterministic Python computes everything else** - the new severity tier, the budget deduction, the remaining negotiation capacity, the next-round eligibility. The LLM never touches a number.
+Once the LLM picks one of those three labels, **deterministic Python computes everything else**: the new severity tier, the budget deduction, the remaining negotiation capacity, the next-round eligibility. The LLM never touches a number.
 
 This separation has three properties production systems need but most agent demos lack:
 
 1. **Auditable.** Every verdict comes with a full transcript: who said what, what position they took, what it cost them. Replay any analysis from the SQLite history.
 2. **Reproducible.** Same inputs produce the same negotiated outcome, regardless of LLM temperature.
-3. **Defensible.** The mediator's final verdict is derived from a budget-weighted state, not from "vibes" — and it falls back to deterministic severity-tier rules if the LLM output is malformed.
+3. **Defensible.** The mediator's final verdict is derived from a budget-weighted state, not from "vibes", and it falls back to deterministic severity-tier rules if the LLM output is malformed.
 
 ### The negotiation has memory across every PR it has ever seen
 
 A single-PR negotiation is only half the idea. The other half: **agents that have historically been right start future negotiations with a larger budget; agents that have been overruled more often start with less.**
 
-After every Mediator verdict, each agent's Round 2 position is scored — did its post-negotiation severity match the one that actually drove the final call? That outcome is written to a persistent `agent_credibility` table (`migrate_v4.py`), Bayesian-smoothed against a 5-negotiation neutral prior so a single early win or loss can't swing anything, and capped at ±15 budget points so no agent can ever fully dominate or be silenced. The next time that agent negotiates — on a completely different PR, days later — it starts from `100 + track_record_adjustment`, not a fresh 100 every time.
+After every Mediator verdict, each agent's Round 2 position is scored. Did its post-negotiation severity match the one that actually drove the final call? That outcome is written to a persistent `agent_credibility` table (`migrate_v4.py`), Bayesian-smoothed against a 5-negotiation neutral prior so a single early win or loss can't swing anything, and capped at ±15 budget points so no agent can ever fully dominate or be silenced. The next time that agent negotiates, on a completely different PR, days later, it starts from `100 + track_record_adjustment`, not a fresh 100 every time.
 
 ```
 effective_budget = 100 + clamp(-15, +15, round((smoothed_win_rate - 0.5) × 30))
 smoothed_win_rate = (wins + 2.5) / (total_negotiations + 5)
 ```
 
-This turns the tribunal from a system that negotiates well **once** into a system that gets better at knowing which of its own voices to trust **over time** — without any human manually re-weighting anything. It's visible directly in the PR comment's negotiation transcript: *"track record: 75% upheld over 12 past negotiations → budget +8."*
+This turns the tribunal from a system that negotiates well **once** into a system that gets better at knowing which of its own voices to trust **over time**, without any human manually re-weighting anything. It's visible directly in the PR comment's negotiation transcript: *"track record: 75% upheld over 12 past negotiations, budget +8."*
 
-All credibility reads/writes are wrapped in `asyncio.to_thread` and fail closed to a neutral bonus — the same blocking-call discipline documented below, applied consistently rather than as a one-off fix.
+All credibility reads/writes are wrapped in `asyncio.to_thread` and fail closed to a neutral bonus, the same blocking-call discipline documented below, applied consistently rather than as a one-off fix.
 
 ---
 
@@ -76,7 +76,7 @@ All credibility reads/writes are wrapped in `asyncio.to_thread` and fail closed 
 
 ### 1. Live dashboard
 
-Open **<https://shiftleft-society.duckdns.org>** in any browser. Click **+ New analysis**, paste vulnerable code, watch the tribunal run live with streaming Round 1 → Round 2 → mediator verdict. End-to-end in ~8–12 seconds.
+Open **<https://shiftleft-society.duckdns.org>** in any browser. Click **+ New analysis**, paste vulnerable code, watch the tribunal run live with streaming Round 1 → Round 2 → mediator verdict. End-to-end in ~8 to 12 seconds.
 
 ### 2. Live GitHub PR integration
 
@@ -90,14 +90,14 @@ Example PR with a real tribunal comment: <https://github.com/jmy744/shiftleft-so
 python benchmark.py
 ```
 
-20-case curated benchmark comparing the multi-agent tribunal against a single-agent baseline. Results committed to the repo at [`benchmark_results.json`](benchmark_results.json).
+40-case curated benchmark comparing the multi-agent tribunal against a single-agent baseline, balanced across vulnerable and safe code. Results committed to the repo at [`benchmark_results.json`](benchmark_results.json).
 
 | System | Correct verdicts | Notes |
 |---|---|---|
-| **Tribunal (multi-agent + negotiation)** | **19 / 20 (95%)** | One false positive on env-var pattern in TC14 |
-| Baseline (single agent, same model) | 16 / 20 (80%) | Misses cross-domain (security ↔ perf) interactions |
+| **Tribunal (multi-agent plus negotiation)** | **38 / 40 (95.0%)** | One miss on an insecure-random-token case |
+| Baseline (single agent, same model) | 33 / 40 (82.5%) | Mostly false positives, flagged safe code as vulnerable |
 
-**+15 absolute points / +18.75% relative improvement** over single-agent on the same Qwen-Max backbone, same prompts, same MCP tools.
+**12.5 absolute points of improvement** over the single agent on the same Qwen-Max backbone, same prompts, same MCP tools. The tribunal's biggest advantage is fewer false alarms: the negotiation cleared safe code (a hashed password, a verified JWT, enabled TLS) that the single agent wrongly flagged as dangerous.
 
 ---
 
@@ -105,18 +105,14 @@ python benchmark.py
 
 |  | Typical AI code-review bot | Other multi-agent demos | **ShiftLeft Society** |
 |---|---|---|---|
-| Number of perspectives | 1 | 2-3 | 2 + mediator |
+| Number of perspectives | 1 | 2 to 3 | 2 plus mediator |
 | Mechanism for disagreement | None | Discussion / voting | **Confidence-budget negotiation** |
 | Cost of being wrong | None | None | **Budget points** |
-
-| Memory across runs | None | None | **Cross-PR credibility — track record adjusts future budget** |
-| Transcript | No | Sometimes | **Always — auditable, replayable** |
-=======
-| Transcript | No | Sometimes | **Always - auditable, replayable** |
-
-| Output format | Custom JSON | Custom JSON | **SARIF 2.1.0 + CycloneDX SBOM** (industry standards) |
+| Memory across runs | None | None | **Cross-PR credibility that adjusts future budget** |
+| Transcript | No | Sometimes | **Always, auditable and replayable** |
+| Output format | Custom JSON | Custom JSON | **SARIF 2.1.0 plus CycloneDX SBOM** (industry standards) |
 | Failure handling | Crashes or returns null | LLM retry | **4-layer fallback chain** (see below) |
-| Live deployment | Varies | Usually localhost demo | **Public HTTPS, Alibaba Cloud Singapore** |
+| Live deployment | Varies | Usually localhost demo | **Public HTTPS on Alibaba Cloud Singapore** |
 | Real PR integration | Yes (closed-source bots) | Rare | **Yes, open-source** |
 
 ---
@@ -169,12 +165,12 @@ python benchmark.py
 
 ### Request lifecycle
 
-1. **Trigger** - dashboard `POST /analyze/start`, or GitHub webhook `POST /webhook/github`
-2. **Round 1 (parallel fan-out via LangGraph Send API)** — Security Auditor and Performance Analyst analyze the code simultaneously, each calling Qwen-Max via Alibaba Cloud's DashScope endpoint and invoking MCP tools where relevant
-3. **Merge & gap check** - deterministic Python compares severity tiers; gap ≥ 1 triggers Round 2
-4. **Round 2 (confidence-budget negotiation)** - each agent picks `DEFEND` / `PARTIAL` / `CONCEDE`, Python computes the cost and new severity
-5. **Mediator synthesis** - Qwen-Max in a structured-output mode generates the final verdict with key findings and remediation code
-6. **Persistence + delivery** - SQLite record, optional SARIF/SBOM export, PR comment posted via GitHub API if triggered from a webhook
+1. **Trigger**: dashboard `POST /analyze/start`, or GitHub webhook `POST /webhook/github`
+2. **Round 1 (parallel fan-out via LangGraph Send API)**: Security Auditor and Performance Analyst analyze the code simultaneously, each calling Qwen-Max via Alibaba Cloud's DashScope endpoint and invoking MCP tools where relevant
+3. **Merge & gap check**: deterministic Python compares severity tiers; gap ≥ 1 triggers Round 2
+4. **Round 2 (confidence-budget negotiation)**: each agent picks `DEFEND` / `PARTIAL` / `CONCEDE`, Python computes the cost and new severity
+5. **Mediator synthesis**: Qwen-Max in a structured-output mode generates the final verdict with key findings and remediation code
+6. **Persistence + delivery**: SQLite record, optional SARIF/SBOM export, PR comment posted via GitHub API if triggered from a webhook
 
 ---
 
@@ -182,7 +178,7 @@ python benchmark.py
 
 The substance under the hood. Each item below addresses a specific failure mode observed in production AI systems.
 
-### Mediator never crashes - 4-layer fallback chain
+### Mediator never crashes, 4-layer fallback chain
 
 ```
 Layer 1: with_structured_output (LangChain Pydantic parsing)
@@ -214,12 +210,12 @@ These are the kinds of issues you only find under real production load. They're 
 
 ### Output is industry-standard, not custom
 
-- **SARIF 2.1.0** - the security-scanning interchange format used by GitHub Code Scanning, Microsoft Defender, Snyk. Schema-valid output means tribunal verdicts can be imported into any SARIF-aware tooling.
-- **CycloneDX SBOM** - software bill of materials in the same format used by enterprise compliance tooling.
+- **SARIF 2.1.0**: the security-scanning interchange format used by GitHub Code Scanning, Microsoft Defender, Snyk. Schema-valid output means tribunal verdicts can be imported into any SARIF-aware tooling.
+- **CycloneDX SBOM**: software bill of materials in the same format used by enterprise compliance tooling.
 
 ### Webhook handler is decoupled from processing
 
-GitHub gives webhooks ~10 seconds to respond. A full tribunal run takes 8–12 seconds. The handler returns `200 OK` in <1 second by spawning the analysis as a tracked background task, then posts the result as a follow-up PR comment.
+GitHub gives webhooks ~10 seconds to respond. A full tribunal run takes 8 to 12 seconds. The handler returns `200 OK` in <1 second by spawning the analysis as a tracked background task, then posts the result as a follow-up PR comment.
 
 ---
 
@@ -261,7 +257,7 @@ Configuration: [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose
 
 ### Cost characteristics
 
-At DashScope international pricing for Qwen-Max ($1.60/M input, $6.40/M output), a typical tribunal run consumes roughly 4–6K input tokens and 1–1.5K output tokens, putting the per-PR cost at approximately **$0.015–$0.020 USD**. At that price point a 1,000-PR-per-month team would spend ~$15–20/month on review — cheaper than 15 minutes of an engineer's time.
+At DashScope international pricing for Qwen-Max ($1.60/M input, $6.40/M output), a typical tribunal run consumes roughly 4 to 6K input tokens and 1 to 1.5K output tokens, putting the per-PR cost at approximately **$0.015, $0.020 USD**. At that price point a 1,000-PR-per-month team would spend ~$15 to 20/month on review, cheaper than 15 minutes of an engineer's time.
 
 ---
 
@@ -314,7 +310,7 @@ shiftleft-society/
 ├── database.py          # SQLite persistence layer
 ├── migrate_v3.py        # Idempotent schema migrations
 ├── migrate_v4.py        # Adds agent_credibility table
-├── benchmark.py         # 20-case tribunal vs baseline benchmark
+├── benchmark.py         # 40-case tribunal vs baseline benchmark
 ├── baseline.py          # Single-agent baseline for comparison
 ├── sarif_export.py      # SARIF 2.1.0 exporter
 ├── cost_tracker.py      # Per-run token + USD cost tracking
@@ -336,19 +332,19 @@ This project addresses Track 3's stated rubric directly:
 | *Task division & role assignment* | Send API parallel fan-out splits each PR into independent Security and Performance analyses; Mediator owns synthesis |
 | *Dialogue & disagreement resolution* | Round 1 reports merged with deterministic severity gap check; Round 2 negotiation triggered on gap ≥ 1 |
 | *Negotiation mechanism* | **Confidence-budget: LLM picks DEFEND / PARTIAL / CONCEDE; Python computes consequence** |
-| *Measurable efficiency gain over single-agent* | **+15 absolute points (95% vs 80%)** on the same 20-case benchmark, same model, same prompts |
+| *Measurable efficiency gain over single-agent* | **+12.5 absolute points (95% vs 82.5%)** on the same 40-case benchmark, same model, same prompts |
 
 ---
 
 ## License
 
-MIT - see [LICENSE](LICENSE). Free to fork, use, modify, and deploy.
+MIT, see [LICENSE](LICENSE). Free to fork, use, modify, and deploy.
 
 ---
 
 <div align="center">
 
-
+**Built for the Qwen Cloud Global AI Hackathon · Track 3: Agent Society**
 
 [Live demo](https://shiftleft-society.duckdns.org) · [Open a test PR](https://github.com/jmy744/shiftleft-society/pulls) · [Read the benchmark](benchmark_results.json)
 
