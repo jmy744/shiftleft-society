@@ -1,6 +1,6 @@
 """
-ShiftLeft Society — Real Benchmark Methodology
-Runs 20 curated test cases through both single-agent baseline and the
+ShiftLeft Society, Real Benchmark Methodology
+Runs 40 curated test cases through both single-agent baseline and the
 multi-agent tribunal. Calculates true positive/negative rates and saves
 results to benchmark_results.json for the hackathon submission.
 
@@ -16,11 +16,8 @@ client = OpenAI(
     base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 )
 
-# =====================================================================
-# 20 TEST CASES — 12 vulnerable/bad, 8 clean/safe
-# =====================================================================
 TEST_CASES = [
-    # --- MUST DETECT (vulnerable) ---
+
     {
         "id": "TC01", "expected": "vulnerable", "category": "SQL_INJECTION",
         "code": "def get_user(uid):\n    query = f\"SELECT * FROM users WHERE id='{uid}'\"\n    db.execute(query)",
@@ -69,7 +66,7 @@ TEST_CASES = [
         "id": "TC12", "expected": "vulnerable", "category": "OPEN_REDIRECT",
         "code": "from flask import redirect, request\ndef go():\n    return redirect(request.args.get('url'))",
     },
-    # --- MUST NOT FLAG (clean/safe) ---
+
     {
         "id": "TC13", "expected": "safe", "category": "PARAMETERIZED_QUERY",
         "code": "def get_user(uid):\n    return db.execute('SELECT id, name FROM users WHERE id = ?', (uid,)).fetchone()",
@@ -102,11 +99,90 @@ TEST_CASES = [
         "id": "TC20", "expected": "safe", "category": "HASHED_PASSWORD",
         "code": "import bcrypt\ndef check_pw(plain, hashed):\n    return bcrypt.checkpw(plain.encode(), hashed)",
     },
+
+    {
+        "id": "TC21", "expected": "vulnerable", "category": "PATH_TRAVERSAL",
+        "code": "def read_file(name):\n    with open('/var/data/' + name) as f:\n        return f.read()",
+    },
+    {
+        "id": "TC22", "expected": "vulnerable", "category": "WEAK_HASH_MD5",
+        "code": "import hashlib\ndef hash_pw(pw):\n    return hashlib.md5(pw.encode()).hexdigest()",
+    },
+    {
+        "id": "TC23", "expected": "vulnerable", "category": "SSRF",
+        "code": "import requests\ndef fetch(url):\n    return requests.get(url).text",
+    },
+    {
+        "id": "TC24", "expected": "vulnerable", "category": "XSS_REFLECTED",
+        "code": "from flask import request\ndef greet():\n    name = request.args.get('name')\n    return '<h1>Hello ' + name + '</h1>'",
+    },
+    {
+        "id": "TC25", "expected": "vulnerable", "category": "HARDCODED_DB_PASSWORD",
+        "code": "conn = connect(host='db.internal', user='admin', password='SuperSecret123!')",
+    },
+    {
+        "id": "TC26", "expected": "vulnerable", "category": "INSECURE_RANDOM_TOKEN",
+        "code": "import random\ndef make_token():\n    return ''.join(random.choice('abcdef0123456789') for _ in range(32))",
+    },
+    {
+        "id": "TC27", "expected": "vulnerable", "category": "DISABLED_TLS_VERIFY",
+        "code": "import requests\ndef call_api(url):\n    return requests.get(url, verify=False).json()",
+    },
+    {
+        "id": "TC28", "expected": "vulnerable", "category": "SUBPROCESS_SHELL_TRUE",
+        "code": "import subprocess\ndef ping(host):\n    subprocess.run('ping -c 1 ' + host, shell=True)",
+    },
+    {
+        "id": "TC29", "expected": "vulnerable", "category": "N_PLUS_ONE_QUERY",
+        "code": "def load_orders(users):\n    result = []\n    for u in users:\n        result.append(db.query('SELECT * FROM orders WHERE user_id=' + str(u.id)))\n    return result",
+    },
+    {
+        "id": "TC30", "expected": "vulnerable", "category": "JWT_NONE_ALG",
+        "code": "import jwt\ndef decode(token):\n    return jwt.decode(token, options={'verify_signature': False})",
+    },
+
+    {
+        "id": "TC31", "expected": "safe", "category": "SAFE_PATH_JOIN",
+        "code": "import os\ndef read_file(name):\n    base = '/var/data'\n    path = os.path.realpath(os.path.join(base, name))\n    if not path.startswith(base): raise ValueError('invalid path')\n    with open(path) as f:\n        return f.read()",
+    },
+    {
+        "id": "TC32", "expected": "safe", "category": "SECURE_RANDOM_TOKEN",
+        "code": "import secrets\ndef make_token():\n    return secrets.token_hex(16)",
+    },
+    {
+        "id": "TC33", "expected": "safe", "category": "TLS_VERIFY_ENABLED",
+        "code": "import requests\ndef call_api(url):\n    return requests.get(url, timeout=5).json()",
+    },
+    {
+        "id": "TC34", "expected": "safe", "category": "SUBPROCESS_LIST_ARGS",
+        "code": "import subprocess\ndef ping(host):\n    subprocess.run(['ping', '-c', '1', host], shell=False)",
+    },
+    {
+        "id": "TC35", "expected": "safe", "category": "BATCHED_QUERY",
+        "code": "def load_orders(user_ids):\n    return db.execute('SELECT * FROM orders WHERE user_id = ANY(%s)', (user_ids,)).fetchall()",
+    },
+    {
+        "id": "TC36", "expected": "safe", "category": "JWT_VERIFIED",
+        "code": "import jwt\ndef decode(token, key):\n    return jwt.decode(token, key, algorithms=['HS256'])",
+    },
+    {
+        "id": "TC37", "expected": "safe", "category": "SANITIZED_HTML",
+        "code": "from markupsafe import escape\nfrom flask import request\ndef greet():\n    return '<h1>Hello ' + str(escape(request.args.get('name'))) + '</h1>'",
+    },
+    {
+        "id": "TC38", "expected": "safe", "category": "CACHED_COMPUTATION",
+        "code": "from functools import lru_cache\n@lru_cache(maxsize=128)\ndef fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)",
+    },
+    {
+        "id": "TC39", "expected": "safe", "category": "CONTEXT_MANAGER_FILE",
+        "code": "def write_log(msg):\n    with open('app.log', 'a') as f:\n        f.write(msg + '\\n')",
+    },
+    {
+        "id": "TC40", "expected": "safe", "category": "SLICED_PAGINATION",
+        "code": "def get_page(items, page, size=50):\n    start = page * size\n    return items[start:start + size]",
+    },
 ]
 
-# =====================================================================
-# BASELINE — single Qwen-Max call, no tools, no structure
-# =====================================================================
 def run_baseline(code: str) -> str:
     resp = client.chat.completions.create(
         model="qwen-max",
@@ -123,9 +199,6 @@ def baseline_correct(answer: str, expected: str) -> bool:
         return "VULNERABLE" in answer
     return "SAFE" in answer
 
-# =====================================================================
-# TRIBUNAL
-# =====================================================================
 async def run_tribunal(tc: dict) -> str:
     state = {
         "run_id": tc["id"], "code": tc["code"],
@@ -145,12 +218,9 @@ def tribunal_correct(verdict: str, expected: str) -> bool:
         return "REJECT" in verdict or "CONDITIONAL" in verdict
     return "APPROVE" in verdict
 
-# =====================================================================
-# MAIN
-# =====================================================================
 async def main():
     print("=" * 60)
-    print("ShiftLeft Society — Real Benchmark (20 test cases)")
+    print("ShiftLeft Society, Real Benchmark (40 test cases)")
     print("=" * 60)
 
     baseline_results = []
@@ -161,7 +231,6 @@ async def main():
     for tc in TEST_CASES:
         print(f"\n[{tc['id']}] {tc['category']} (expected: {tc['expected']})")
 
-        # Baseline
         t0 = time.time()
         try:
             b_answer = run_baseline(tc["code"])
@@ -170,7 +239,6 @@ async def main():
             b_answer = f"ERROR: {e}"; b_ok = False
         b_time = round(time.time() - t0, 2)
 
-        # Tribunal
         t0 = time.time()
         try:
             t_verdict = await run_tribunal(tc)
