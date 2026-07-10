@@ -27,9 +27,6 @@ from mcp import ClientSession
 
 import credibility
 
-# =====================================================================
-# 1. CONFIGURATION
-# =====================================================================
 _api_key = os.environ.get("QWEN_API_KEY")
 if not _api_key:
     raise EnvironmentError("QWEN_API_KEY environment variable not set.")
@@ -39,14 +36,10 @@ os.environ["OPENAI_API_BASE"] = "https://dashscope-intl.aliyuncs.com/compatible-
 
 MCP_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8001/mcp")
 
-# Round 1 + Round 2 agents — generous token budget, structured output works fine here
-llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=4096)
+llm = ChatOpenAI(model="qwen3.7-max", temperature=0.1, max_tokens=4096)
 
-# Mediator — separate instance with a hard 3000-token cap to prevent runaway.
-# Even if Qwen-Max goes off the rails it cannot burn 170+ seconds.
-mediator_llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=3000)
+mediator_llm = ChatOpenAI(model="qwen3.7-max", temperature=0.1, max_tokens=3000)
 
-# Negotiation parameters
 INITIAL_BUDGET = 100
 COST_PER_TIER  = 30
 COST_PARTIAL   = 15
@@ -55,10 +48,6 @@ COST_CONCEDE   = 0
 TIER = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0, "SAFE": 0, "INFO": 0, "UNKNOWN": -1}
 TIER_NAMES = {3: "CRITICAL", 2: "HIGH", 1: "MEDIUM", 0: "LOW"}
 
-
-# =====================================================================
-# 2. STATE
-# =====================================================================
 class AgentMessage(TypedDict):
     sender: str
     round: int
@@ -87,10 +76,6 @@ class TribunalState(TypedDict):
     final_verdict: dict
     mcp_verified:  bool
 
-
-# =====================================================================
-# 3. PYDANTIC SCHEMAS — Round 1 & Round 2 only (mediator no longer uses)
-# =====================================================================
 def _coerce_to_int(v, default: int = 80) -> int:
     if v is None or v == "":
         return default
@@ -110,7 +95,6 @@ def _coerce_to_int(v, default: int = 80) -> int:
             except ValueError:
                 pass
     return default
-
 
 def _coerce_llm_output(data: dict) -> dict:
     STRING_FIELDS = {
@@ -146,7 +130,6 @@ def _coerce_llm_output(data: dict) -> dict:
                         coerced.append(str(item))
                 data[key] = coerced
     return data
-
 
 class SecurityReport(BaseModel):
     severity:        str  = Field(description="CRITICAL, HIGH, MEDIUM, LOW, or SAFE")
@@ -188,10 +171,6 @@ class DebateResponse(BaseModel):
     @classmethod
     def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
 
-
-# =====================================================================
-# 4. MCP CLIENT
-# =====================================================================
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     try:
         async with streamablehttp_client(MCP_URL) as (read, write, _):
@@ -236,7 +215,6 @@ def _internal_fallback(tool_name: str, arguments: dict) -> dict:
         if re.search(r'SELECT\s+\*|\.get_all\s*\(', code, re.IGNORECASE):
             issues.append({"type": "FULL_TABLE_SCAN", "severity": "HIGH"})
 
-        # v2.4: detect nested for-loops (O(n²)+) — fixes TC10
         nested = len(re.findall(r'\bfor\b[^\n]*:\s*\n\s+for\b', code))
         if nested >= 2:
             issues.append({"type": "TRIPLE_NESTED_LOOP", "severity": "CRITICAL", "depth": nested + 1})
@@ -280,10 +258,6 @@ def _generate_sbom(code: str, filename: str, run_id: str) -> dict:
         "dependencies": [{"ref": filename, "validator": "ShiftLeft Society Tribunal v2.4"}],
     }
 
-
-# =====================================================================
-# 5. NEGOTIATION HELPERS
-# =====================================================================
 def _tier(severity: str) -> int:
     return TIER.get((severity or "UNKNOWN").upper(), -1)
 
@@ -321,16 +295,11 @@ def _compute_negotiation(my_severity: str, other_severity: str, position: str, b
         "defend_cost":      gap * COST_PER_TIER,
     }
 
-
-# =====================================================================
-# 6. MEDIATOR HELPERS — robust parsing & severity-based fallback
-# =====================================================================
 def _infer_verdict_from_state(state: TribunalState) -> str:
     """If mediator output is unusable, infer verdict from negotiated (or R1) severities."""
     sec_sev = state.get("security_severity", "UNKNOWN")
     perf_sev = state.get("performance_severity", "UNKNOWN")
 
-    # Prefer negotiated severities if Round 2 ran
     sec_r2 = state.get("security_r2", {}) or {}
     perf_r2 = state.get("performance_r2", {}) or {}
     if sec_r2.get("revised_severity"):
@@ -345,7 +314,6 @@ def _infer_verdict_from_state(state: TribunalState) -> str:
         return "CONDITIONAL APPROVAL"
     return "APPROVE"
 
-
 def _parse_mediator_text(text: str, state: TribunalState) -> dict:
     """
     Robust mediator output parser. Handles:
@@ -354,16 +322,16 @@ def _parse_mediator_text(text: str, state: TribunalState) -> dict:
       - Partial/truncated JSON (regex-extracts what it can)
       - Total garbage (falls back to severity-based verdict)
     """
-    # Strip markdown code fences
+
     cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
     cleaned = re.sub(r'\s*```$', '', cleaned)
 
     parsed = None
-    # Try clean JSON parse
+
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to recover the largest valid JSON object substring
+
         first_brace = cleaned.find('{')
         last_brace = cleaned.rfind('}')
         if first_brace != -1 and last_brace > first_brace:
@@ -372,7 +340,6 @@ def _parse_mediator_text(text: str, state: TribunalState) -> dict:
             except json.JSONDecodeError:
                 parsed = None
 
-    # If we have a dict, normalize it
     if isinstance(parsed, dict):
         verdict = (parsed.get("verdict") or "").strip().upper()
         if "REJECT" in verdict:
@@ -392,7 +359,6 @@ def _parse_mediator_text(text: str, state: TribunalState) -> dict:
             "key_findings":        _normalize_findings(parsed.get("key_findings")),
         }
 
-    # No usable JSON — regex extraction
     verdict = None
     verdict_match = re.search(r'"verdict"\s*:\s*"([^"]+)"', cleaned, re.IGNORECASE)
     if verdict_match:
@@ -424,7 +390,6 @@ def _parse_mediator_text(text: str, state: TribunalState) -> dict:
         "key_findings":        findings or _default_findings(state),
     }
 
-
 def _normalize_findings(raw) -> List[str]:
     if raw is None:
         return []
@@ -440,7 +405,6 @@ def _normalize_findings(raw) -> List[str]:
         return out[:5]
     return [str(raw)]
 
-
 def _default_resolution(state: TribunalState) -> str:
     if not state.get("conflict_detected"):
         return "Agents agreed in Round 1 — no negotiation required."
@@ -455,7 +419,6 @@ def _default_resolution(state: TribunalState) -> str:
         f"(spent {perf_r2.get('budget_spent','?')}/{INITIAL_BUDGET})."
     )
 
-
 def _default_findings(state: TribunalState) -> List[str]:
     sec_r1 = state.get("security_r1", {}) or {}
     perf_r1 = state.get("performance_r1", {}) or {}
@@ -466,10 +429,6 @@ def _default_findings(state: TribunalState) -> List[str]:
         findings.append(f"Performance: {perf_r1['title']}")
     return findings or ["Tribunal analysis complete."]
 
-
-# =====================================================================
-# 7. AGENT NODES
-# =====================================================================
 async def initialize(state: TribunalState) -> dict:
     mcp_ok = await verify_mcp_server()
     return {
@@ -692,7 +651,7 @@ async def lead_mediator(state: TribunalState) -> dict:
 
     vd = None
     try:
-        # Raw ainvoke — no structured output. Mediator's 3000 token cap prevents runaway.
+
         response = await mediator_llm.ainvoke(prompt)
         raw_text = response.content if hasattr(response, "content") else str(response)
         vd = _parse_mediator_text(raw_text, state)
@@ -709,18 +668,6 @@ async def lead_mediator(state: TribunalState) -> dict:
     if vd.get("verdict") == "APPROVE":
         vd["sbom"] = _generate_sbom(state["code"], state["filename"], state["run_id"])
 
-    # --- Cross-PR credibility: record whether each agent's Round 2 judgment was sound ---
-    #
-    # An agent's judgment is "sound" (a win) if EITHER:
-    #   (a) it held a position matching the final driving (highest) severity, OR
-    #   (b) it DEFERRED (PARTIAL / CONCEDE) to a peer flagging an equal-or-higher
-    #       severity — deferring to a more serious, valid concern is good judgment.
-    #
-    # An agent only LOSES if it DEFENDED a position that did not end up driving the
-    # verdict — i.e. it dug in on its own severity and was overruled by a higher one.
-    #
-    # This corrects the earlier metric, which punished an agent simply for conceding
-    # to a higher-severity peer even when that concession was the correct call.
     if state.get("conflict_detected"):
         sec_r2  = state.get("security_r2",  {})
         perf_r2 = state.get("performance_r2", {})
@@ -736,13 +683,13 @@ async def lead_mediator(state: TribunalState) -> dict:
                 if not sev:
                     return False
                 position = (r2.get("position") or "").upper()
-                # (a) held the driving severity
+
                 if _tier(sev) == highest_tier:
                     return True
-                # (b) deferred (PARTIAL/CONCEDE) to a higher-severity peer — correct deference
+
                 if position in ("PARTIAL", "CONCEDE"):
                     return True
-                # otherwise: DEFENDED a non-driving severity, or other → overruled
+
                 return False
 
             try:
@@ -761,10 +708,6 @@ async def lead_mediator(state: TribunalState) -> dict:
     print(f"[Lead Mediator] verdict={vd.get('verdict')}")
     return {"final_verdict": vd, "dialogue_history": [msg]}
 
-
-# =====================================================================
-# 8. ROUTING
-# =====================================================================
 def fan_out_round1(state: TribunalState) -> list:
     return [
         Send("security_auditor_r1",    state),
@@ -779,10 +722,6 @@ def route_after_conflict(state: TribunalState):
         ]
     return "lead_mediator"
 
-
-# =====================================================================
-# 9. BUILD GRAPH
-# =====================================================================
 builder = StateGraph(TribunalState)
 
 builder.add_node("initialize",             initialize)

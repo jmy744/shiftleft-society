@@ -22,7 +22,7 @@ def run_baseline(code: str, filename: str = "unknown.py") -> str:
     - Misses compound vulnerabilities (security + performance interaction)
     """
     resp = client.chat.completions.create(
-        model="qwen-max",
+        model="qwen3.7-max",
         messages=[
             {
                 "role": "system",
@@ -39,7 +39,7 @@ def run_baseline(code: str, filename: str = "unknown.py") -> str:
     return resp.choices[0].message.content.strip().upper()
 
 if __name__ == "__main__":
-    # Quick smoke test
+
     test_code = "db.execute(f\"SELECT * FROM users WHERE id='{user_id}'\")"
     result = run_baseline(test_code)
     print(f"Baseline result: {result}")

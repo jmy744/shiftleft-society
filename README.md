@@ -82,7 +82,7 @@ Open **<https://shiftleft-society.duckdns.org>** in any browser. Click **+ New a
 
 Webhook fires on every `pull_request.opened` and `pull_request.synchronize` event. The tribunal analyzes the diff and posts a comment with the verdict, severity badges, collapsible negotiation transcript, and remediation code.
 
-Example PR with a real tribunal comment: <https://github.com/jmy744/shiftleft-society/pull/2>
+Example PR with a real tribunal comment: <https://github.com/jmy744/shiftleft-society/pull/4>
 
 ### 3. Reproducible benchmark
 
@@ -231,7 +231,7 @@ All agent reasoning is powered by **Qwen-Max** through Alibaba Cloud's DashScope
 from langchain_openai import ChatOpenAI
 
 llm = ChatOpenAI(
-    model="qwen-max",
+    model="qwen3.7-max",
     api_key=os.getenv("QWEN_API_KEY"),
     base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     temperature=0.3,

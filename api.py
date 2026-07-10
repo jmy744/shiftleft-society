@@ -34,10 +34,6 @@ DB_PATH               = "tribunal_history.db"
 active_jobs: Dict[str, asyncio.Queue] = {}
 mcp_process = None
 
-# asyncio.create_task() only keeps a WEAK reference to the task internally.
-# If nothing else holds a strong reference, the task can be garbage-collected
-# mid-execution — a well-documented asyncio footgun. We keep created background
-# tasks here until they finish, then remove themselves via the done-callback.
 _background_tasks: set = set()
 
 def _spawn_background(coro):
@@ -58,10 +54,6 @@ AGENT_DISPLAY = {
 SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "NONE": 0, "INFO": 0, "SAFE": 0}
 NEGO_POSITIONS = {"DEFEND", "PARTIAL", "CONCEDE"}
 
-
-# =====================================================================
-# HELPERS
-# =====================================================================
 def _db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -75,7 +67,6 @@ def _combined_severity(sec: str, perf: str) -> str:
     perf = (perf or "NONE").upper()
     return sec if SEVERITY_RANK.get(sec, 0) >= SEVERITY_RANK.get(perf, 0) else perf
 
-
 def _role_from_sender(sender: str) -> str:
     s = (sender or "").lower()
     if "lead mediator" in s or "mediator" in s:
@@ -85,7 +76,6 @@ def _role_from_sender(sender: str) -> str:
     if "performance" in s:
         return "performance"
     return "system"
-
 
 def _parse_dialogue_item(m: dict) -> dict:
     sender = m.get("sender", m.get("agent", m.get("role", "unknown")))
@@ -168,10 +158,6 @@ def _parse_dialogue_item(m: dict) -> dict:
         out["nego"] = nego
     return out
 
-
-# =====================================================================
-# LIFECYCLE
-# =====================================================================
 @app.on_event("startup")
 async def startup():
     global mcp_process
@@ -190,10 +176,6 @@ async def shutdown():
     if mcp_process:
         mcp_process.terminate()
 
-
-# =====================================================================
-# HEALTH
-# =====================================================================
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "ShiftLeft Society", "version": "2.4"}
@@ -204,15 +186,11 @@ async def alibaba_proof():
         "deployment": "Alibaba Cloud ECS",
         "region":     os.environ.get("ALIBABA_CLOUD_REGION", "ap-southeast-1"),
         "instance_id": os.environ.get("ECS_INSTANCE_ID", "i-shiftleft"),
-        "model":      "qwen-max",
+        "model":      "qwen3.7-max",
         "endpoint":   "dashscope-intl.aliyuncs.com",
         "mcp_server": f"http://localhost:{os.environ.get('MCP_PORT', 8001)}/mcp",
     }
 
-
-# =====================================================================
-# TRIBUNAL
-# =====================================================================
 class CodePayload(BaseModel):
     code:              str
     filename:          str = "auth_service.py"
@@ -312,7 +290,6 @@ async def run_tribunal_task(run_id: str, payload: CodePayload, queue: asyncio.Qu
     finally:
         await queue.put({"type": "_sentinel"})
 
-
 @app.post("/analyze/start")
 async def start_analysis(payload: CodePayload) -> dict:
     run_id = str(uuid.uuid4())
@@ -320,7 +297,6 @@ async def start_analysis(payload: CodePayload) -> dict:
     active_jobs[run_id] = queue
     _spawn_background(run_tribunal_task(run_id, payload, queue))
     return {"run_id": run_id, "stream_url": f"/analyze/stream/{run_id}"}
-
 
 @app.get("/analyze/stream/{run_id}")
 async def stream_analysis(run_id: str):
@@ -350,10 +326,6 @@ async def stream_analysis(run_id: str):
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
-
-# =====================================================================
-# HISTORY & COMPLIANCE HUB
-# =====================================================================
 @app.get("/history")
 async def get_history(limit: int = 50):
     return {"status": "ok", "analyses": await db.get_history(limit)}
@@ -379,10 +351,6 @@ async def download_sbom(run_id: str):
 async def get_stats():
     return {"status": "ok", "stats": await db.get_stats()}
 
-
-# =====================================================================
-# OPERATOR CONSOLE & THEATRE REPLAY
-# =====================================================================
 @app.get("/analyses")
 async def list_analyses(
     limit: int = Query(50, ge=1, le=200),
@@ -425,7 +393,6 @@ async def list_analyses(
         analyses.append(d)
 
     return {"count": len(analyses), "analyses": analyses}
-
 
 @app.get("/analyses/{run_id}/replay")
 async def get_replay(run_id: str):
@@ -473,7 +440,6 @@ async def get_replay(run_id: str):
         "messages": messages,
         "message_count": len(messages),
     }
-
 
 @app.get("/analyses/{run_id}/sarif")
 async def get_sarif(run_id: str):
@@ -528,10 +494,6 @@ async def get_sarif(run_id: str):
         },
     )
 
-
-# =====================================================================
-# GITHUB WEBHOOK
-# =====================================================================
 def _verify_sig(body: bytes, sig: str) -> bool:
     if not GITHUB_WEBHOOK_SECRET:
         return True
@@ -690,11 +652,7 @@ async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: st
     if diff_url:
         try:
             hdrs = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-            # requests.get() is BLOCKING — run it in a thread so it never
-            # freezes the single-threaded asyncio event loop. Without this,
-            # a slow diff fetch can stall the whole app, including sending
-            # GitHub's webhook response, causing GitHub to report a
-            # "timed out" delivery even though our handler already returned.
+
             resp = await asyncio.to_thread(requests.get, diff_url, headers=hdrs, timeout=15)
             diff_code = resp.text[:8000]
         except Exception as e:
@@ -735,7 +693,6 @@ async def _process_pr_webhook(repo: str, pr_num: int, pr_title: str, pr_body: st
 
     active_jobs.pop(run_id, None)
 
-
 @app.post("/webhook/github")
 async def github_webhook(
     request: Request,
@@ -759,18 +716,10 @@ async def github_webhook(
     pr_body  = pr.get("body", "")
     diff_url = pr.get("diff_url", "")
 
-    # Respond to GitHub immediately — never block on the tribunal run.
-    # Processing + comment-posting continues in the background. Uses
-    # _spawn_background to prevent the task being garbage-collected mid-run.
     _spawn_background(_process_pr_webhook(repo, pr_num, pr_title, pr_body, diff_url))
 
     return {"status": "accepted", "pr": pr_num}
 
-
-# =====================================================================
-# STATIC FRONTEND — serves index.html and any other static files at root
-# This MUST be defined LAST so it doesn't shadow the API routes above.
-# =====================================================================
 @app.get("/")
 async def serve_index():
     index_path = Path("index.html")
@@ -778,7 +727,5 @@ async def serve_index():
         return FileResponse(index_path)
     raise HTTPException(404, "index.html not found — make sure it's in the project root.")
 
-
-# =====================================================================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

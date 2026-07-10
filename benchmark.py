@@ -1,5 +1,5 @@
 """
-ShiftLeft Society, Real Benchmark Methodology
+ShiftLeft Society — Real Benchmark Methodology
 Runs 40 curated test cases through both single-agent baseline and the
 multi-agent tribunal. Calculates true positive/negative rates and saves
 results to benchmark_results.json for the hackathon submission.
@@ -185,7 +185,7 @@ TEST_CASES = [
 
 def run_baseline(code: str) -> str:
     resp = client.chat.completions.create(
-        model="qwen-max",
+        model="qwen3.7-max",
         messages=[
             {"role": "system", "content": "You are a code reviewer. Reply with VULNERABLE or SAFE."},
             {"role": "user",   "content": f"Is this code vulnerable?\n```\n{code}\n```\nReply with exactly one word: VULNERABLE or SAFE."}
@@ -220,7 +220,7 @@ def tribunal_correct(verdict: str, expected: str) -> bool:
 
 async def main():
     print("=" * 60)
-    print("ShiftLeft Society, Real Benchmark (40 test cases)")
+    print("ShiftLeft Society — Real Benchmark (40 test cases)")
     print("=" * 60)
 
     baseline_results = []
