@@ -231,7 +231,7 @@ All agent reasoning is powered by **Qwen-Max** through Alibaba Cloud's DashScope
 from langchain_openai import ChatOpenAI
 
 llm = ChatOpenAI(
-    model="qwen3.7-max",
+    model="qwen-max",
     api_key=os.getenv("QWEN_API_KEY"),
     base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     temperature=0.3,

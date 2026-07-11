@@ -22,7 +22,7 @@ def run_baseline(code: str, filename: str = "unknown.py") -> str:
     - Misses compound vulnerabilities (security + performance interaction)
     """
     resp = client.chat.completions.create(
-        model="qwen3.7-max",
+        model="qwen-max",
         messages=[
             {
                 "role": "system",

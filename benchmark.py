@@ -185,7 +185,7 @@ TEST_CASES = [
 
 def run_baseline(code: str) -> str:
     resp = client.chat.completions.create(
-        model="qwen3.7-max",
+        model="qwen-max",
         messages=[
             {"role": "system", "content": "You are a code reviewer. Reply with VULNERABLE or SAFE."},
             {"role": "user",   "content": f"Is this code vulnerable?\n```\n{code}\n```\nReply with exactly one word: VULNERABLE or SAFE."}

@@ -25,7 +25,7 @@ QWEN_TURBO_OUTPUT_PRICE = 1.20
 class CostTracker:
     """Accumulates token usage across multiple LLM calls within one analysis."""
 
-    def __init__(self, model: str = "qwen3.7-max"):
+    def __init__(self, model: str = "qwen-max"):
         self.model = model
         self.input_tokens = 0
         self.output_tokens = 0
@@ -74,7 +74,7 @@ class CostTracker:
             "calls": self.call_count,
         }
 
-def estimate_cost(input_tokens: int, output_tokens: int, model: str = "qwen3.7-max") -> float:
+def estimate_cost(input_tokens: int, output_tokens: int, model: str = "qwen-max") -> float:
     """Standalone helper for quick cost estimates."""
     t = CostTracker(model=model)
     t.add_raw(input_tokens, output_tokens)

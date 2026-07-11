@@ -36,9 +36,9 @@ os.environ["OPENAI_API_BASE"] = "https://dashscope-intl.aliyuncs.com/compatible-
 
 MCP_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8001/mcp")
 
-llm = ChatOpenAI(model="qwen3.7-max", temperature=0.1, max_tokens=4096)
+llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=4096)
 
-mediator_llm = ChatOpenAI(model="qwen3.7-max", temperature=0.1, max_tokens=3000)
+mediator_llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=3000)
 
 INITIAL_BUDGET = 100
 COST_PER_TIER  = 30

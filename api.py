@@ -186,7 +186,7 @@ async def alibaba_proof():
         "deployment": "Alibaba Cloud ECS",
         "region":     os.environ.get("ALIBABA_CLOUD_REGION", "ap-southeast-1"),
         "instance_id": os.environ.get("ECS_INSTANCE_ID", "i-shiftleft"),
-        "model":      "qwen3.7-max",
+        "model":      "qwen-max",
         "endpoint":   "dashscope-intl.aliyuncs.com",
         "mcp_server": f"http://localhost:{os.environ.get('MCP_PORT', 8001)}/mcp",
     }
