@@ -128,7 +128,7 @@ async def llm_report(role: str, code: str, filename: str, issue: str, evidence: 
     from langchain_openai import ChatOpenAI
     llm = ChatOpenAI(model=settings.qwen_model, api_key=settings.qwen_api_key,
                      base_url=settings.qwen_base_url, temperature=0, max_tokens=900, timeout=30)
-        prompt = (
+    prompt = (
         f"You are the {role} specialist. Analyze {filename}. Goal: {issue}.\n"
         f"Tool evidence: {json.dumps(evidence)}\n"
         f"Code:\n{code[:settings.max_code_chars]}\n"
