@@ -225,7 +225,9 @@ This project uses Alibaba Cloud as both its **inference layer** and its **deploy
 
 ### Inference: Qwen-Max via DashScope
 
-All agent reasoning is powered by **Qwen-Max** through Alibaba Cloud's DashScope API (international endpoint, `ap-southeast-1`):
+When configured, specialist analysis uses **Qwen-Max** through Alibaba Cloud's
+DashScope OpenAI-compatible API (international endpoint). Deterministic scans
+remain active as guardrails and as an explicitly labelled outage fallback:
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -239,6 +241,24 @@ llm = ChatOpenAI(
 ```
 
 Source: [`tribunal.py`](tribunal.py)
+
+For a Render deployment, add these values under **Service → Environment** and
+then deploy the latest commit:
+
+```dotenv
+QWEN_API_KEY=<a newly generated DashScope key>
+QWEN_MODEL=qwen-max
+QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+OFFLINE_MODE=false
+```
+
+The key and endpoint must belong to the same DashScope region. Do not put the
+real key in `.env.example`, the README, a commit, an issue, or application logs.
+`GET /health` reports only whether Qwen is configured; it cannot prove that the
+provider accepted a request. A completed run reports `qwen_guarded` only after
+both specialist calls succeed. It reports `degraded_fallback` when either call
+fails, and Render logs record the safe exception class and HTTP status for
+diagnosis.
 
 ### Deployment: ECS + ECS-native networking
 
