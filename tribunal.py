@@ -1,752 +1,349 @@
-"""
-ShiftLeft Society — LangGraph Agent Society
-Track 3: Agent Society | Qwen Cloud Hackathon 2026
+"""Reliable multi-agent tribunal with deterministic offline fallbacks."""
 
-v2.4 — BULLETPROOF MEDIATOR
-  - Mediator uses raw ainvoke (not with_structured_output) to prevent
-    Qwen-Max runaway-token bug that kept hitting 8192-token ceiling.
-  - Robust JSON parsing with regex fallback.
-  - Severity-based verdict inference if mediator output is garbage.
-  - mediator_llm capped at 3000 max_tokens (separate instance).
-  - Nested-loop detection added to MCP fallback (fixes TC10).
-"""
+from __future__ import annotations
 
-import os
-import re
+import asyncio
+import ast
+import hashlib
 import json
-import operator
-from datetime import datetime
-from typing import TypedDict, List, Annotated, Literal
+import re
+from datetime import datetime, timezone
+from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, START, END
-from langgraph.types import Send
-from mcp.client.streamable_http import streamablehttp_client
-from mcp import ClientSession
+from pydantic import BaseModel, Field
 
-import credibility
+from cost_tracker import estimate_cost
+from settings import settings
 
-_api_key = os.environ.get("QWEN_API_KEY")
-if not _api_key:
-    raise EnvironmentError("QWEN_API_KEY environment variable not set.")
+try:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+except ImportError:  # compatible with older MCP SDKs
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
-os.environ["OPENAI_API_KEY"] = _api_key
-os.environ["OPENAI_API_BASE"] = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
-MCP_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8001/mcp")
-
-llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=4096)
-
-mediator_llm = ChatOpenAI(model="qwen-max", temperature=0.1, max_tokens=3000)
-
+SEVERITIES = ("SAFE", "LOW", "MEDIUM", "HIGH", "CRITICAL")
+RANK = {name: index for index, name in enumerate(SEVERITIES)}
 INITIAL_BUDGET = 100
-COST_PER_TIER  = 30
-COST_PARTIAL   = 15
-COST_CONCEDE   = 0
 
-TIER = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0, "SAFE": 0, "INFO": 0, "UNKNOWN": -1}
-TIER_NAMES = {3: "CRITICAL", 2: "HIGH", 1: "MEDIUM", 0: "LOW"}
 
-class AgentMessage(TypedDict):
-    sender: str
-    round: int
-    content: str
-    timestamp: str
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-class TribunalState(TypedDict):
-    run_id:            str
-    code:              str
-    filename:          str
-    issue_description: str
 
-    round1_reports:   Annotated[List[dict], operator.add]
-    round2_responses: Annotated[List[dict], operator.add]
-    dialogue_history: Annotated[List[AgentMessage], operator.add]
-
-    security_r1:          dict
-    performance_r1:       dict
-    security_severity:    str
-    performance_severity: str
-    conflict_detected:    bool
-    severity_gap:         int
-    security_r2:          dict
-    performance_r2:       dict
-
-    final_verdict: dict
-    mcp_verified:  bool
-
-def _coerce_to_int(v, default: int = 80) -> int:
-    if v is None or v == "":
-        return default
-    if isinstance(v, bool):
-        return default
-    if isinstance(v, (int, float)):
-        return max(1, min(100, int(v)))
-    if isinstance(v, str):
-        SEVERITY_MAP = {"CRITICAL": 95, "HIGH": 85, "MEDIUM": 60, "LOW": 30, "SAFE": 20, "INFO": 20, "NONE": 10}
-        up = v.strip().upper()
-        if up in SEVERITY_MAP:
-            return SEVERITY_MAP[up]
-        m = re.search(r'-?\d+', v)
-        if m:
-            try:
-                return max(1, min(100, int(m.group(0))))
-            except ValueError:
-                pass
-    return default
-
-def _coerce_llm_output(data: dict) -> dict:
-    STRING_FIELDS = {
-        'reasoning_chain', 'title', 'description', 'fix', 'argument',
-        'conflict_resolution', 'position', 'revised_severity', 'agent',
-        'verdict', 'complexity_label', 'remediation_code', 'severity',
-    }
-    LIST_STR_FIELDS = {'secrets_found', 'mcp_findings', 'issues_found', 'key_findings'}
-    INT_FIELDS = {'confidence_score'}
-
-    for key, value in list(data.items()):
-        if value is None:
-            continue
-        if key in INT_FIELDS:
-            data[key] = _coerce_to_int(value, default=80)
-        elif key in STRING_FIELDS:
-            if isinstance(value, list):
-                data[key] = ' '.join(str(i) for i in value)
-            elif not isinstance(value, str):
-                data[key] = str(value)
-            else:
-                if key in ('severity', 'revised_severity'):
-                    data[key] = value.strip().upper()
-        elif key in LIST_STR_FIELDS:
-            if isinstance(value, dict):
-                data[key] = [f"{k}: {v}" for k, v in value.items() if v not in (None, [], {})]
-            elif isinstance(value, list):
-                coerced = []
-                for item in value:
-                    if isinstance(item, dict):
-                        coerced.append(item.get('type', item.get('description', str(item))))
-                    elif item is not None:
-                        coerced.append(str(item))
-                data[key] = coerced
-    return data
-
-class SecurityReport(BaseModel):
-    severity:        str  = Field(description="CRITICAL, HIGH, MEDIUM, LOW, or SAFE")
-    title:           str  = Field(default="Security Analysis")
-    description:     str  = Field(default="")
-    fix:             str  = Field(default="Review and remediate identified issues.")
-    confidence_score: int = Field(default=85, ge=1, le=100)
-    reasoning_chain: str  = Field(default="Analysis performed by MCP scanner.")
-    secrets_found:   List[str] = Field(default=[])
-    mcp_findings:    List[str] = Field(default=[])
-
-    @model_validator(mode='before')
-    @classmethod
-    def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
-
-class PerformanceReport(BaseModel):
-    severity:         str = Field(description="CRITICAL, HIGH, MEDIUM, LOW, or SAFE")
-    title:            str = Field(default="Performance Analysis")
-    description:      str = Field(default="")
-    confidence_score: int = Field(default=85, ge=1, le=100)
-    reasoning_chain:  str = Field(default="Analysis performed by AST profiler.")
-    complexity_label: str = Field(default="UNKNOWN")
-    issues_found:     List[str] = Field(default=[])
-
-    @model_validator(mode='before')
-    @classmethod
-    def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
-
-class DebateResponse(BaseModel):
-    agent:            str = Field(default="agent")
-    position:         Literal["DEFEND", "PARTIAL", "CONCEDE"] = Field(
-        description="DEFEND = hold severity. PARTIAL = move halfway. CONCEDE = adopt other."
-    )
-    argument:         str = Field(default="No rebuttal provided.")
-    revised_severity: str = Field(default="HIGH", description="CRITICAL/HIGH/MEDIUM/LOW/SAFE")
+class SpecialistReport(BaseModel):
+    severity: str = "SAFE"
+    title: str = "No material issue"
+    description: str = "No material issue detected."
+    fix: str = "No change required."
     confidence_score: int = Field(default=80, ge=1, le=100)
+    issues_found: list[str] = Field(default_factory=list)
+    secrets_found: list[str] = Field(default_factory=list)
 
-    @model_validator(mode='before')
-    @classmethod
-    def coerce(cls, v): return _coerce_llm_output(v) if isinstance(v, dict) else v
 
-async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
-    try:
-        async with streamablehttp_client(MCP_URL) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                if result.content and hasattr(result.content[0], "text"):
-                    return json.loads(result.content[0].text)
-                return {}
-    except Exception as e:
-        print(f"[MCP] Fallback — {tool_name}: {e}")
-        return _internal_fallback(tool_name, arguments)
+def severity(value: Any) -> str:
+    value = str(value or "SAFE").upper().replace("NONE", "SAFE")
+    return value if value in RANK else "SAFE"
 
-def _internal_fallback(tool_name: str, arguments: dict) -> dict:
-    code = arguments.get("code", "")
-    if tool_name == "scan_vulnerabilities":
-        findings = []
-        if re.search(r'execute\s*\(\s*f["\']', code):
-            findings.append({"cwe": "CWE-89", "type": "SQL_INJECTION", "severity": "CRITICAL"})
-        if re.search(r'\b(eval|exec|os\.system)\s*\(', code):
-            findings.append({"cwe": "CWE-94", "type": "CODE_INJECTION", "severity": "CRITICAL"})
-        if re.search(r'pickle\.(loads|load)\s*\(', code):
-            findings.append({"cwe": "CWE-502", "type": "INSECURE_DESERIALIZATION", "severity": "HIGH"})
-        return {"findings": findings, "highest_severity": "CRITICAL" if findings else "SAFE"}
-    if tool_name == "detect_secrets":
-        SECRET_PATTERNS = {
-            "QWEN_API_KEY": r"sk-ws-[A-Za-z0-9._\-]{20,}",
-            "OPENAI_KEY":   r"sk-[A-Za-z0-9]{32,}",
-            "AWS_KEY_ID":   r"AKIA[0-9A-Z]{16}",
-            "GITHUB_PAT":   r"ghp_[A-Za-z0-9]{36}",
-            "GENERIC_KEY":  r"(?i)(api[_-]?key)\s*[=:]\s*['\"][A-Za-z0-9]{8,}",
-        }
-        found = [n for n, p in SECRET_PATTERNS.items() if re.search(p, code)]
-        return {"secrets_detected": found, "severity": "CRITICAL" if found else "SAFE"}
-    if tool_name == "check_yaml_pinning":
-        yaml = arguments.get("yaml_content", code)
-        unpinned = re.findall(r'uses:\s+(\S+)@(?![0-9a-f]{40})(\S+)', yaml)
-        return {"unpinned_actions": [f"{a}@{t}" for a, t in unpinned],
-                "severity": "CRITICAL" if unpinned else "SAFE"}
-    if tool_name == "analyze_complexity":
-        issues = []
-        if re.search(r'SELECT\s+\*|\.get_all\s*\(', code, re.IGNORECASE):
-            issues.append({"type": "FULL_TABLE_SCAN", "severity": "HIGH"})
 
-        nested = len(re.findall(r'\bfor\b[^\n]*:\s*\n\s+for\b', code))
-        if nested >= 2:
-            issues.append({"type": "TRIPLE_NESTED_LOOP", "severity": "CRITICAL", "depth": nested + 1})
-        elif nested >= 1:
-            issues.append({"type": "NESTED_LOOP", "severity": "HIGH", "depth": 2})
-
-        complexity = len(re.findall(r'\b(if|elif|for|while|except)\b', code)) + 1
-        highest = "SAFE"
-        for i in issues:
-            if _tier(i["severity"]) > _tier(highest):
-                highest = i["severity"]
-        return {"performance_issues": issues, "cyclomatic_complexity": complexity, "severity": highest}
-    return {}
-
-async def verify_mcp_server() -> bool:
-    try:
-        async with streamablehttp_client(MCP_URL) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await session.list_tools()
-                print(f"[MCP] Verified. Tools: {[t.name for t in tools.tools]}")
-                return True
-    except Exception as e:
-        print(f"[MCP] Unavailable: {e}. Using internal fallback.")
-        return False
-
-def _generate_sbom(code: str, filename: str, run_id: str) -> dict:
-    import hashlib
-    return {
-        "bomFormat": "CycloneDX", "specVersion": "1.4",
-        "serialNumber": f"urn:uuid:{run_id}",
-        "metadata": {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "tools": [{"vendor": "ShiftLeft Society", "name": "Tribunal", "version": "2.4"}],
-            "component": {
-                "type": "application", "name": filename,
-                "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(code.encode()).hexdigest()}],
-            },
-        },
-        "components": [],
-        "dependencies": [{"ref": filename, "validator": "ShiftLeft Society Tribunal v2.4"}],
-    }
-
-def _tier(severity: str) -> int:
-    return TIER.get((severity or "UNKNOWN").upper(), -1)
-
-def _sev_name(tier: int) -> str:
-    return TIER_NAMES.get(max(0, min(3, tier)), "UNKNOWN")
-
-def _compute_negotiation(my_severity: str, other_severity: str, position: str, budget: int = INITIAL_BUDGET) -> dict:
-    my_t    = _tier(my_severity)
-    other_t = _tier(other_severity)
-    gap     = abs(my_t - other_t)
-
-    if position == "DEFEND":
-        revised = my_severity.upper()
-        spent   = gap * COST_PER_TIER
-    elif position == "PARTIAL":
-        mid = (my_t + other_t) / 2
-        revised = _sev_name(int(round(mid + 0.01)))
-        spent   = COST_PARTIAL
-    else:
-        revised = other_severity.upper()
-        spent   = COST_CONCEDE
-
-    if spent > budget:
-        revised = other_severity.upper()
-        spent   = budget
-        position = "CONCEDE"
-
-    return {
-        "position":         position,
-        "revised_severity": revised,
-        "budget_spent":     spent,
-        "budget_total":     budget,
-        "budget_remaining": budget - spent,
-        "gap_tiers":        gap,
-        "defend_cost":      gap * COST_PER_TIER,
-    }
-
-def _infer_verdict_from_state(state: TribunalState) -> str:
-    """If mediator output is unusable, infer verdict from negotiated (or R1) severities."""
-    sec_sev = state.get("security_severity", "UNKNOWN")
-    perf_sev = state.get("performance_severity", "UNKNOWN")
-
-    sec_r2 = state.get("security_r2", {}) or {}
-    perf_r2 = state.get("performance_r2", {}) or {}
-    if sec_r2.get("revised_severity"):
-        sec_sev = sec_r2["revised_severity"]
-    if perf_r2.get("revised_severity"):
-        perf_sev = perf_r2["revised_severity"]
-
-    highest = max(_tier(sec_sev), _tier(perf_sev))
-    if highest >= 3:
-        return "REJECT"
-    if highest == 2:
-        return "CONDITIONAL APPROVAL"
-    return "APPROVE"
-
-def _parse_mediator_text(text: str, state: TribunalState) -> dict:
-    """
-    Robust mediator output parser. Handles:
-      - Clean JSON
-      - JSON wrapped in markdown code blocks
-      - Partial/truncated JSON (regex-extracts what it can)
-      - Total garbage (falls back to severity-based verdict)
-    """
-
-    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip())
-    cleaned = re.sub(r'\s*```$', '', cleaned)
-
-    parsed = None
-
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-
-        first_brace = cleaned.find('{')
-        last_brace = cleaned.rfind('}')
-        if first_brace != -1 and last_brace > first_brace:
-            try:
-                parsed = json.loads(cleaned[first_brace:last_brace + 1])
-            except json.JSONDecodeError:
-                parsed = None
-
-    if isinstance(parsed, dict):
-        verdict = (parsed.get("verdict") or "").strip().upper()
-        if "REJECT" in verdict:
-            verdict = "REJECT"
-        elif "CONDITIONAL" in verdict:
-            verdict = "CONDITIONAL APPROVAL"
-        elif "APPROVE" in verdict:
-            verdict = "APPROVE"
-        else:
-            verdict = _infer_verdict_from_state(state)
-
-        return {
-            "verdict":             verdict,
-            "remediation_code":    str(parsed.get("remediation_code") or "# Remediation not generated."),
-            "promise_verified":    bool(parsed.get("promise_verified", False)),
-            "conflict_resolution": str(parsed.get("conflict_resolution") or _default_resolution(state)),
-            "key_findings":        _normalize_findings(parsed.get("key_findings")),
-        }
-
-    verdict = None
-    verdict_match = re.search(r'"verdict"\s*:\s*"([^"]+)"', cleaned, re.IGNORECASE)
-    if verdict_match:
-        v = verdict_match.group(1).strip().upper()
-        if "REJECT" in v: verdict = "REJECT"
-        elif "CONDITIONAL" in v: verdict = "CONDITIONAL APPROVAL"
-        elif "APPROVE" in v: verdict = "APPROVE"
-    if not verdict:
-        verdict = _infer_verdict_from_state(state)
-
-    findings_match = re.search(r'"key_findings"\s*:\s*\[([^\]]*)\]', cleaned, re.DOTALL)
-    findings = []
-    if findings_match:
-        findings = re.findall(r'"((?:[^"\\]|\\.)*)"', findings_match.group(1))[:5]
-
-    remediation_match = re.search(r'"remediation_code"\s*:\s*"((?:[^"\\]|\\.)*)"', cleaned, re.DOTALL)
-    remediation = "# Remediation truncated. See finding descriptions."
-    if remediation_match:
-        try:
-            remediation = remediation_match.group(1).encode('utf-8').decode('unicode_escape')
-        except Exception:
-            remediation = remediation_match.group(1)
-
-    return {
-        "verdict":             verdict,
-        "remediation_code":    remediation,
-        "promise_verified":    False,
-        "conflict_resolution": _default_resolution(state),
-        "key_findings":        findings or _default_findings(state),
-    }
-
-def _normalize_findings(raw) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, list):
-        out = []
-        for item in raw:
-            if isinstance(item, dict):
-                out.append(item.get("description") or item.get("type") or str(item))
-            elif item is not None:
-                out.append(str(item))
-        return out[:5]
-    return [str(raw)]
-
-def _default_resolution(state: TribunalState) -> str:
-    if not state.get("conflict_detected"):
-        return "Agents agreed in Round 1 — no negotiation required."
-    sec_r2 = state.get("security_r2", {}) or {}
-    perf_r2 = state.get("performance_r2", {}) or {}
-    return (
-        f"Security chose {sec_r2.get('position','?')} "
-        f"→ {sec_r2.get('revised_severity','?')} "
-        f"(spent {sec_r2.get('budget_spent','?')}/{INITIAL_BUDGET}). "
-        f"Performance chose {perf_r2.get('position','?')} "
-        f"→ {perf_r2.get('revised_severity','?')} "
-        f"(spent {perf_r2.get('budget_spent','?')}/{INITIAL_BUDGET})."
-    )
-
-def _default_findings(state: TribunalState) -> List[str]:
-    sec_r1 = state.get("security_r1", {}) or {}
-    perf_r1 = state.get("performance_r1", {}) or {}
-    findings = []
-    if sec_r1.get("title"):
-        findings.append(f"Security: {sec_r1['title']}")
-    if perf_r1.get("title"):
-        findings.append(f"Performance: {perf_r1['title']}")
-    return findings or ["Tribunal analysis complete."]
-
-async def initialize(state: TribunalState) -> dict:
-    mcp_ok = await verify_mcp_server()
-    return {
-        "mcp_verified":    mcp_ok,
-        "round1_reports":  [],
-        "round2_responses": [],
-        "dialogue_history": [],
-    }
-
-async def security_auditor_r1(state: TribunalState) -> dict:
-    print(f"[Security R1] Analyzing {state['filename']}...")
-    vuln   = await call_mcp_tool("scan_vulnerabilities", {"code": state["code"], "filename": state["filename"]})
-    secret = await call_mcp_tool("detect_secrets",       {"code": state["code"]})
-    yaml_d = {}
-    if state["filename"].endswith((".yml", ".yaml")):
-        yaml_d = await call_mcp_tool("check_yaml_pinning", {"yaml_content": state["code"]})
-
-    secrets_alert = (
-        f"\n🚨 SECRETS CONFIRMED: {secret.get('secrets_detected')} — severity MUST be CRITICAL.\n"
-        if secret.get("secrets_detected") else ""
-    )
-    yaml_alert = (
-        f"\n🚨 UNPINNED YAML ACTIONS: {yaml_d.get('unpinned_actions')} — severity MUST be CRITICAL.\n"
-        if yaml_d.get("unpinned_actions") else ""
-    )
-    prompt = (
-        f"You are the Elite Security Auditor in the ShiftLeft Society DevSecOps Tribunal.\n"
-        f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n\n"
-        f"CODE TO ANALYZE:\n```\n{state['code']}\n```\n\n"
-        f"REFERENCE MCP TOOL FINDINGS (use as evidence, do NOT echo back):\n"
-        f"{json.dumps({'vulns': vuln.get('findings',[]), 'secrets': secret.get('secrets_detected',[]), 'yaml': yaml_d}, indent=2)}\n"
-        f"{secrets_alert}{yaml_alert}\n"
-        f"Your findings will be challenged by the Performance Analyst — be precise and decisive.\n\n"
-        f"YOUR TASK: Output a flat JSON object with these REQUIRED fields:\n"
-        f"  - severity: one of 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'SAFE'\n"
-        f"  - title: short headline\n"
-        f"  - description: ≤2 sentence explanation\n"
-        f"  - fix: suggested remediation approach\n"
-        f"  - confidence_score: INTEGER between 1 and 100\n"
-        f"  - reasoning_chain: ≤2 sentence chain of reasoning\n"
-        f"  - secrets_found: list of secret names if any\n"
-        f"  - mcp_findings: list of MCP-flagged issues"
-    )
-    report = await llm.with_structured_output(SecurityReport).ainvoke(prompt)
-    rd = report.model_dump()
-    rd.update({"role": "security", "round": 1})
-    msg: AgentMessage = {"sender": "Security Auditor", "round": 1, "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z"}
-    return {"round1_reports": [rd], "dialogue_history": [msg]}
-
-async def performance_analyst_r1(state: TribunalState) -> dict:
-    print("[Performance R1] Profiling complexity...")
-    complexity = await call_mcp_tool("analyze_complexity", {"code": state["code"]})
-    prompt = (
-        f"You are the Performance Analyst in the ShiftLeft Society DevSecOps Tribunal.\n"
-        f"FILE: {state['filename']} | PROMISE: {state['issue_description']}\n\n"
-        f"CODE TO ANALYZE:\n```\n{state['code']}\n```\n\n"
-        f"REFERENCE MCP COMPLEXITY FINDINGS (use as evidence, do NOT echo back):\n"
-        f"{json.dumps(complexity, indent=2)}\n"
-        f"If MCP flagged NESTED_LOOP or TRIPLE_NESTED_LOOP, severity MUST be HIGH or CRITICAL respectively.\n"
-        f"Your findings will be challenged by the Security Auditor — be precise and decisive.\n\n"
-        f"YOUR TASK: Output a flat JSON object with these REQUIRED fields:\n"
-        f"  - severity: one of 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'SAFE'\n"
-        f"  - title: short headline\n"
-        f"  - description: ≤2 sentence explanation\n"
-        f"  - confidence_score: INTEGER between 1 and 100\n"
-        f"  - reasoning_chain: ≤2 sentence chain of reasoning\n"
-        f"  - complexity_label: e.g. O(n), O(n²), O(n³)\n"
-        f"  - issues_found: list of performance issues"
-    )
-    report = await llm.with_structured_output(PerformanceReport).ainvoke(prompt)
-    rd = report.model_dump()
-    rd.update({"role": "performance", "round": 1})
-    msg: AgentMessage = {"sender": "Performance Analyst", "round": 1, "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z"}
-    return {"round1_reports": [rd], "dialogue_history": [msg]}
-
-def merge_round1(state: TribunalState) -> dict:
-    sec  = next((r for r in state["round1_reports"] if r.get("role") == "security"),    {})
-    perf = next((r for r in state["round1_reports"] if r.get("role") == "performance"), {})
-    sec_sev_upper  = (sec.get("severity",  "UNKNOWN") or "UNKNOWN").upper()
-    perf_sev_upper = (perf.get("severity", "UNKNOWN") or "UNKNOWN").upper()
-    s_tier = _tier(sec_sev_upper)
-    p_tier = _tier(perf_sev_upper)
-    gap    = abs(s_tier - p_tier)
-    conflict = gap >= 1
-    print(f"[merge_round1] Security={sec_sev_upper} vs Performance={perf_sev_upper} | Gap={gap} | Negotiation={conflict}")
-    return {
-        "security_r1":          sec,
-        "performance_r1":       perf,
-        "security_severity":    sec_sev_upper,
-        "performance_severity": perf_sev_upper,
-        "severity_gap":         gap,
-        "conflict_detected":    conflict,
-    }
-
-async def security_debates(state: TribunalState) -> dict:
-    print("[Security R2] Negotiating...")
-    my_sev    = state["security_severity"]
-    other_sev = state["performance_severity"]
-    gap       = state.get("severity_gap", 1)
-    defend_cost = gap * COST_PER_TIER
-
-    cred = await credibility.get_budget_bonus("security_auditor")
-    effective_budget = max(0, INITIAL_BUDGET + cred["bonus"])
-
-    prompt = (
-        f"Security Auditor — Round 2.\n"
-        f"Confidence budget: {effective_budget} "
-        f"(base {INITIAL_BUDGET}, track-record adjustment {cred['bonus']:+d} "
-        f"from {cred['total']} past negotiations, {cred['win_rate']:.0%} upheld).\n"
-        f"Your R1: {my_sev} | Other: {other_sev} | Gap: {gap} tier(s)\n"
-        f"Positions: DEFEND (cost {defend_cost}) | PARTIAL (cost {COST_PARTIAL}) | CONCEDE (cost {COST_CONCEDE}).\n"
-        f"YOUR R1 REPORT: {json.dumps(state['security_r1'], indent=2)}\n"
-        f"PERFORMANCE R1: {json.dumps(state['performance_r1'], indent=2)}\n"
-        f"Output flat JSON: agent, position (DEFEND/PARTIAL/CONCEDE), argument (1-2 sentences), "
-        f"revised_severity (CRITICAL/HIGH/MEDIUM/LOW/SAFE), confidence_score (INTEGER 1-100)."
-    )
-    resp = await llm.with_structured_output(DebateResponse).ainvoke(prompt)
-    rd = resp.model_dump()
-    nego = _compute_negotiation(my_sev, other_sev, rd["position"], budget=effective_budget)
-    rd.update(nego)
-    rd["role"] = "security_r2"
-    rd["credibility"] = cred
-    msg: AgentMessage = {
-        "sender": "Security Auditor (Round 2)", "round": 2,
-        "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
-    print(f"[Security R2] {rd['position']} → {rd['revised_severity']} "
-          f"(spent {rd['budget_spent']}/{effective_budget}, trust={cred['win_rate']:.0%})")
-    return {"round2_responses": [rd], "dialogue_history": [msg]}
-
-async def performance_debates(state: TribunalState) -> dict:
-    print("[Performance R2] Negotiating...")
-    my_sev    = state["performance_severity"]
-    other_sev = state["security_severity"]
-    gap       = state.get("severity_gap", 1)
-    defend_cost = gap * COST_PER_TIER
-
-    cred = await credibility.get_budget_bonus("performance_analyst")
-    effective_budget = max(0, INITIAL_BUDGET + cred["bonus"])
-
-    prompt = (
-        f"Performance Analyst — Round 2.\n"
-        f"Confidence budget: {effective_budget} "
-        f"(base {INITIAL_BUDGET}, track-record adjustment {cred['bonus']:+d} "
-        f"from {cred['total']} past negotiations, {cred['win_rate']:.0%} upheld).\n"
-        f"Your R1: {my_sev} | Other: {other_sev} | Gap: {gap} tier(s)\n"
-        f"Positions: DEFEND (cost {defend_cost}) | PARTIAL (cost {COST_PARTIAL}) | CONCEDE (cost {COST_CONCEDE}).\n"
-        f"YOUR R1 REPORT: {json.dumps(state['performance_r1'], indent=2)}\n"
-        f"SECURITY R1: {json.dumps(state['security_r1'], indent=2)}\n"
-        f"Output flat JSON: agent, position (DEFEND/PARTIAL/CONCEDE), argument (1-2 sentences), "
-        f"revised_severity (CRITICAL/HIGH/MEDIUM/LOW/SAFE), confidence_score (INTEGER 1-100)."
-    )
-    resp = await llm.with_structured_output(DebateResponse).ainvoke(prompt)
-    rd = resp.model_dump()
-    nego = _compute_negotiation(my_sev, other_sev, rd["position"], budget=effective_budget)
-    rd.update(nego)
-    rd["role"] = "performance_r2"
-    rd["credibility"] = cred
-    msg: AgentMessage = {
-        "sender": "Performance Analyst (Round 2)", "round": 2,
-        "content": json.dumps(rd), "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
-    print(f"[Performance R2] {rd['position']} → {rd['revised_severity']} "
-          f"(spent {rd['budget_spent']}/{effective_budget}, trust={cred['win_rate']:.0%})")
-    return {"round2_responses": [rd], "dialogue_history": [msg]}
-
-def merge_round2(state: TribunalState) -> dict:
-    sec_r2  = next((r for r in state["round2_responses"] if r.get("role") == "security_r2"),    {})
-    perf_r2 = next((r for r in state["round2_responses"] if r.get("role") == "performance_r2"), {})
-    return {"security_r2": sec_r2, "performance_r2": perf_r2}
-
-async def lead_mediator(state: TribunalState) -> dict:
-    """
-    v2.4: Uses raw ainvoke + robust parsing instead of with_structured_output.
-    Even if Qwen-Max produces garbage, we ALWAYS return a valid verdict.
-    """
-    print("[Lead Mediator] Synthesizing...")
-
-    debate_log = "\n\n".join(
-        f"[{m['sender']} | R{m['round']}]\n{m['content']}"
-        for m in state.get("dialogue_history", [])
-    )
-
-    negotiation_summary = ""
-    if state.get("conflict_detected"):
-        sec_r2  = state.get("security_r2",  {})
-        perf_r2 = state.get("performance_r2", {})
-        negotiated = []
-        if sec_r2.get("revised_severity"):  negotiated.append(sec_r2["revised_severity"])
-        if perf_r2.get("revised_severity"): negotiated.append(perf_r2["revised_severity"])
-        highest = max(negotiated, key=lambda s: _tier(s)) if negotiated else "SAFE"
-        negotiation_summary = (
-            f"\nNEGOTIATION RESULT: highest negotiated severity = {highest}. "
-            f"Use this severity for verdict mapping.\n"
-        )
-
-    code_lines = state['code'].count('\n') + 1
-    if code_lines < 20:
-        length_rule = "remediation_code ≤ 15 lines. conflict_resolution ≤ 2 sentences. key_findings ≤ 3."
-    else:
-        length_rule = "remediation_code ≤ 40 lines. conflict_resolution ≤ 3 sentences. key_findings ≤ 5."
-
-    prompt = (
-        f"You are the Lead Mediator. BE EXTREMELY CONCISE.\n"
-        f"PROMISE: {state['issue_description']}\nFILE: {state['filename']}\n"
-        f"{negotiation_summary}\n"
-        f"TRANSCRIPT (for context — do not echo back):\n{debate_log[:2500]}\n\n"
-        f"LENGTH: {length_rule}\n\n"
-        f"VERDICT MAPPING (strict):\n"
-        f"  highest severity CRITICAL → verdict = 'REJECT'\n"
-        f"  highest severity HIGH     → verdict = 'CONDITIONAL APPROVAL'\n"
-        f"  highest severity MEDIUM/LOW/SAFE → verdict = 'APPROVE'\n\n"
-        f"Output ONE JSON object, nothing else, no markdown:\n"
-        f'{{"verdict": "APPROVE|CONDITIONAL APPROVAL|REJECT", '
-        f'"remediation_code": "raw code only no backticks", '
-        f'"promise_verified": true|false, '
-        f'"conflict_resolution": "brief explanation", '
-        f'"key_findings": ["short", "phrases"]}}'
-    )
-
-    vd = None
-    try:
-
-        response = await mediator_llm.ainvoke(prompt)
-        raw_text = response.content if hasattr(response, "content") else str(response)
-        vd = _parse_mediator_text(raw_text, state)
-    except Exception as e:
-        print(f"[Lead Mediator] LLM call failed: {e}. Falling back to severity-based verdict.")
-        vd = {
-            "verdict":             _infer_verdict_from_state(state),
-            "remediation_code":    "# Mediator unavailable. Apply Round 1 fix recommendations.",
-            "promise_verified":    False,
-            "conflict_resolution": _default_resolution(state),
-            "key_findings":        _default_findings(state),
-        }
-
-    if vd.get("verdict") == "APPROVE":
-        vd["sbom"] = _generate_sbom(state["code"], state["filename"], state["run_id"])
-
-    if state.get("conflict_detected"):
-        sec_r2  = state.get("security_r2",  {})
-        perf_r2 = state.get("performance_r2", {})
-        negotiated = []
-        if sec_r2.get("revised_severity"):  negotiated.append(sec_r2["revised_severity"])
-        if perf_r2.get("revised_severity"): negotiated.append(perf_r2["revised_severity"])
-
-        if negotiated:
-            highest_tier = max(_tier(s) for s in negotiated)
-
-            def _judgment_sound(r2: dict) -> bool:
-                sev = r2.get("revised_severity")
-                if not sev:
-                    return False
-                position = (r2.get("position") or "").upper()
-
-                if _tier(sev) == highest_tier:
-                    return True
-
-                if position in ("PARTIAL", "CONCEDE"):
-                    return True
-
-                return False
-
-            try:
-                if sec_r2.get("revised_severity"):
-                    await credibility.record_outcome("security_auditor", _judgment_sound(sec_r2))
-                if perf_r2.get("revised_severity"):
-                    await credibility.record_outcome("performance_analyst", _judgment_sound(perf_r2))
-            except Exception as e:
-                print(f"[Lead Mediator] credibility recording failed (non-fatal): {e}")
-
-    msg: AgentMessage = {
-        "sender": "Lead Mediator", "round": 3,
-        "content": json.dumps(vd),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
-    print(f"[Lead Mediator] verdict={vd.get('verdict')}")
-    return {"final_verdict": vd, "dialogue_history": [msg]}
-
-def fan_out_round1(state: TribunalState) -> list:
-    return [
-        Send("security_auditor_r1",    state),
-        Send("performance_analyst_r1", state),
+def local_security(code: str, filename: str = "unknown") -> dict:
+    issues: list[tuple[str, str, str]] = []
+    rules = [
+        (r'execute\s*\(\s*f["\']', "CRITICAL", "SQL injection"),
+        (r'\b(eval|exec)\s*\(', "CRITICAL", "Dynamic code execution"),
+        (r'\bos\.(system|popen)\s*\(', "HIGH", "Shell command execution"),
+        (r'subprocess\.(run|call|Popen)\s*\([^\n]*shell\s*=\s*True', "CRITICAL", "Shell injection risk"),
+        (r'pickle\.(loads|load)\s*\(', "HIGH", "Unsafe deserialization"),
+        (r'yaml\.load\s*\([^)]*\)(?![^\n]*Loader)', "HIGH", "Unsafe YAML loading"),
+        (r'requests\.(get|post|put|delete)\s*\([^\n]*verify\s*=\s*False', "HIGH", "TLS verification disabled"),
     ]
+    for pattern, sev, title in rules:
+        if re.search(pattern, code, re.I):
+            issues.append((sev, title, pattern))
+    assigned_query_pattern = re.compile(
+        r'(?m)^[+-]?\s*([A-Za-z_]\w*)\s*=\s*f["\'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\n'
+        r'[\s\S]*?\.execute(?:many)?\s*\(\s*\1\s*\)',
+        re.IGNORECASE,
+    )
+    assigned_query_match = assigned_query_pattern.search(code)
+    if assigned_query_match:
+        issues.append(("CRITICAL", "SQL injection", "assigned-interpolated-query"))
+    # Detect the common two-step form: an interpolated query is assigned to a
+    # variable and that variable is later passed to execute(). A regex that
+    # only looks for execute(f"...") misses this data flow.
+    try:
+        tree = ast.parse(code)
+        interpolated_names = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Name)
+            and isinstance(node.value, (ast.JoinedStr, ast.BinOp))
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            first_argument = node.args[0]
+            if (
+                function_name in {"execute", "executemany"}
+                and isinstance(first_argument, ast.Name)
+                and first_argument.id in interpolated_names
+            ):
+                issues.append(("CRITICAL", "SQL injection", "interpolated-query-data-flow"))
+                break
+    except SyntaxError:
+        pass
+    secret_patterns = {
+        "AWS access key": r"AKIA[0-9A-Z]{16}", "GitHub token": r"gh[pousr]_[A-Za-z0-9]{20,}",
+        "private key": r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----",
+        "hardcoded password": r"(?i)(password|passwd|pwd)\s*=\s*['\"][^'\"]{6,}",
+    }
+    secrets = [name for name, pattern in secret_patterns.items() if re.search(pattern, code)]
+    if filename.endswith((".yml", ".yaml")) and re.search(r"uses:\s+\S+@(?![0-9a-f]{40})(\S+)", code):
+        issues.append(("HIGH", "Unpinned GitHub Action", "uses"))
+    if secrets:
+        issues.append(("CRITICAL", "Hardcoded secret", "secret"))
+    highest = max((sev for sev, _, _ in issues), key=lambda x: RANK[x], default="SAFE")
+    titles = [title for _, title, _ in issues]
+    return SpecialistReport(
+        severity=highest,
+        title=titles[0] if titles else "No security defect detected",
+        description="; ".join(titles) if titles else "The deterministic scanner found no known dangerous pattern.",
+        fix="Remove unsafe data flow and use parameterized, validated, least-privilege APIs." if issues else "No security remediation required.",
+        confidence_score=95 if issues else 72, issues_found=titles, secrets_found=secrets,
+    ).model_dump()
 
-def route_after_conflict(state: TribunalState):
-    if state.get("conflict_detected"):
-        return [
-            Send("security_debates",    state),
-            Send("performance_debates", state),
+
+def local_performance(code: str) -> dict:
+    issues: list[tuple[str, str]] = []
+    if re.search(r"SELECT\s+\*", code, re.I): issues.append(("MEDIUM", "Unbounded SELECT *"))
+    if re.search(r"\bwhile\s+True\s*:", code): issues.append(("HIGH", "Potential unbounded loop"))
+    if "time.sleep(" in code and "async def" in code: issues.append(("MEDIUM", "Blocking sleep in async code"))
+    try:
+        tree = ast.parse(code)
+        nested = any(isinstance(node, (ast.For, ast.While)) and any(
+            isinstance(child, (ast.For, ast.While)) for child in ast.iter_child_nodes(node)
+        ) for node in ast.walk(tree))
+        if nested: issues.append(("HIGH", "Nested iteration"))
+    except SyntaxError:
+        pass
+    highest = max((sev for sev, _ in issues), key=lambda x: RANK[x], default="SAFE")
+    titles = [title for _, title in issues]
+    return SpecialistReport(
+        severity=highest, title=titles[0] if titles else "No performance defect detected",
+        description="; ".join(titles) if titles else "No obvious performance anti-pattern was found.",
+        fix="Bound work, avoid blocking calls, and move filtering to indexed queries." if issues else "No performance remediation required.",
+        confidence_score=90 if issues else 70, issues_found=titles,
+    ).model_dump()
+
+
+async def call_mcp(tool: str, arguments: dict) -> tuple[dict, bool]:
+    if settings.offline_mode:
+        return {}, False
+    try:
+        async with asyncio.timeout(3):
+            async with streamable_http_client(settings.mcp_url) as streams:
+                read, write = streams[0], streams[1]
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(tool, arguments)
+                    text = next((item.text for item in result.content if hasattr(item, "text")), "{}")
+                    return json.loads(text), True
+    except Exception:
+        return {}, False
+
+
+async def llm_report(role: str, code: str, filename: str, issue: str, evidence: dict) -> tuple[dict, dict]:
+    deterministic = local_security(code, filename) if role == "security" else local_performance(code)
+    if not settings.use_llm:
+        report = deterministic
+        report["analysis_source"] = "deterministic_offline"
+        return report, {"input_tokens": 0, "output_tokens": 0}
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(model=settings.qwen_model, api_key=settings.qwen_api_key,
+                     base_url=settings.qwen_base_url, temperature=0, max_tokens=900, timeout=30)
+    prompt = (f"You are the {role} specialist. Analyze {filename}. Goal: {issue}.\n"
+              f"Tool evidence: {json.dumps(evidence)}\nCode:\n{code[:settings.max_code_chars]}\n"
+              "Return exactly one JSON object with severity (SAFE/LOW/MEDIUM/HIGH/CRITICAL), "
+              "title, description, fix, confidence_score, issues_found, and secrets_found. "
+              "Do not use markdown fences or add text outside the JSON object.")
+    try:
+        # Use an ordinary OpenAI-compatible chat completion instead of
+        # provider-specific structured-output APIs. DashScope's compatibility
+        # endpoint supports chat completions consistently, while JSON-schema
+        # response formats vary by model and SDK version.
+        response = await asyncio.wait_for(llm.ainvoke(prompt), 45)
+        report = parse_specialist_response(response.content)
+        report["severity"] = severity(report["severity"])
+        report = enforce_deterministic_floor(report, deterministic)
+        report["analysis_source"] = "qwen_with_deterministic_guardrail"
+        metadata = getattr(response, "usage_metadata", None) or {}
+        usage = {
+            "input_tokens": metadata.get("input_tokens") or max(1, len(prompt) // 4),
+            "output_tokens": metadata.get("output_tokens") or max(1, len(json.dumps(report)) // 4),
+        }
+        return report, usage
+    except Exception as exc:
+        # Never print credentials or request bodies. The exception class is
+        # sufficient to distinguish provider/auth/transport fallback in logs.
+        status = getattr(exc, "status_code", None)
+        status_note = f" status={status}" if status else ""
+        print(f"[Qwen] {role} request failed: {type(exc).__name__}{status_note}; using deterministic fallback")
+        report = deterministic
+        report["description"] += " (Provider unavailable; deterministic fallback used.)"
+        report["analysis_source"] = "deterministic_fallback"
+        return report, {"input_tokens": 0, "output_tokens": 0}
+
+
+def parse_specialist_response(content: Any) -> dict:
+    """Parse a provider's JSON text without relying on proprietary schema APIs."""
+    if isinstance(content, list):
+        content = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    text = str(content or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("Qwen response did not contain a JSON object")
+    parsed = json.loads(text[start:end + 1])
+    return SpecialistReport.model_validate(parsed).model_dump()
+
+
+def enforce_deterministic_floor(model_report: dict, deterministic_report: dict) -> dict:
+    """Never let an LLM downgrade a vulnerability proven by deterministic evidence."""
+    guarded = model_report.copy()
+    model_severity = severity(guarded.get("severity"))
+    deterministic_severity = severity(deterministic_report.get("severity"))
+    if RANK[deterministic_severity] > RANK[model_severity]:
+        guarded["severity"] = deterministic_severity
+        guarded["title"] = deterministic_report.get("title") or guarded.get("title")
+        guarded["description"] = (
+            f"{guarded.get('description', '').strip()} "
+            f"Deterministic guardrail: {deterministic_report.get('description', '')}"
+        ).strip()
+        guarded["fix"] = deterministic_report.get("fix") or guarded.get("fix")
+    guarded["issues_found"] = list(dict.fromkeys(
+        deterministic_report.get("issues_found", []) + guarded.get("issues_found", [])
+    ))
+    guarded["secrets_found"] = list(dict.fromkeys(
+        deterministic_report.get("secrets_found", []) + guarded.get("secrets_found", [])
+    ))
+    return guarded
+
+
+def negotiate(own: str, other: str) -> dict:
+    own, other = severity(own), severity(other)
+    gap = abs(RANK[own] - RANK[other])
+    if gap <= 1:
+        position, revised, spent = "PARTIAL", SEVERITIES[max(RANK[own], RANK[other])], 15
+    elif RANK[own] > RANK[other]:
+        position, revised, spent = "DEFEND", own, gap * 30
+    else:
+        position, revised, spent = "CONCEDE", other, 0
+    if spent > INITIAL_BUDGET:
+        position, revised, spent = "CONCEDE", other, 0
+    return {"position": position, "revised_severity": revised, "budget_spent": spent,
+            "budget_total": INITIAL_BUDGET, "budget_remaining": INITIAL_BUDGET - spent,
+            "gap_tiers": gap, "defend_cost": gap * 30}
+
+
+def make_sbom(code: str, filename: str, run_id: str) -> dict:
+    components = []
+    imports = set(re.findall(r"^(?:from|import)\s+([A-Za-z0-9_.-]+)", code, re.M))
+    for name in sorted(imports):
+        root = name.split(".")[0]
+        components.append({"type": "library", "name": root, "bom-ref": f"pkg:pypi/{root}",
+                           "properties": [{"name": "shiftleft:evidence", "value": "source-import"}]})
+    app_ref = f"urn:shiftleft:{run_id}"
+    return {"bomFormat": "CycloneDX", "specVersion": "1.5", "serialNumber": f"urn:uuid:{run_id}",
+            "version": 1, "metadata": {"timestamp": now(), "component": {
+                "type": "application", "name": filename, "bom-ref": app_ref,
+                "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(code.encode()).hexdigest()}]}},
+            "components": components,
+            "dependencies": [{"ref": app_ref, "dependsOn": [c["bom-ref"] for c in components]}]}
+
+
+class TribunalEngine:
+    async def ainvoke(self, state: dict) -> dict:
+        result = state.copy()
+        code, filename, issue = state["code"], state["filename"], state["issue_description"]
+        sec_evidence, sec_mcp = await call_mcp("scan_vulnerabilities", {"code": code, "filename": filename})
+        perf_evidence, perf_mcp = await call_mcp("analyze_complexity", {"code": code})
+        (sec, sec_usage), (perf, perf_usage) = await asyncio.gather(
+            llm_report("security", code, filename, issue, sec_evidence),
+            llm_report("performance", code, filename, issue, perf_evidence),
+        )
+        sources = {sec.get("analysis_source"), perf.get("analysis_source")}
+        analysis_mode = (
+            "qwen_guarded" if sources == {"qwen_with_deterministic_guardrail"}
+            else "offline" if sources == {"deterministic_offline"}
+            else "degraded_fallback"
+        )
+        print(f"[Tribunal] run={state['run_id']} mode={analysis_mode} sources={sorted(sources)}")
+        dialogue = [
+            {"sender": "Security Auditor", "round": 1, "content": json.dumps(sec), "timestamp": now()},
+            {"sender": "Performance Analyst", "round": 1, "content": json.dumps(perf), "timestamp": now()},
         ]
-    return "lead_mediator"
+        conflict = sec["severity"] != perf["severity"]
+        sec_r2 = perf_r2 = {}
+        final_severities = [sec["severity"], perf["severity"]]
+        if conflict:
+            sec_r2, perf_r2 = negotiate(sec["severity"], perf["severity"]), negotiate(perf["severity"], sec["severity"])
+            sec_r2.update({"role": "security_r2", "argument": "Deterministic evidence-weighted position."})
+            perf_r2.update({"role": "performance_r2", "argument": "Deterministic evidence-weighted position."})
+            dialogue += [
+                {"sender": "Security Auditor (Round 2)", "round": 2, "content": json.dumps(sec_r2), "timestamp": now()},
+                {"sender": "Performance Analyst (Round 2)", "round": 2, "content": json.dumps(perf_r2), "timestamp": now()},
+            ]
+            final_severities = [sec_r2["revised_severity"], perf_r2["revised_severity"]]
+        highest = max(final_severities, key=lambda x: RANK[severity(x)])
+        verdict_name = "REJECT" if RANK[highest] >= RANK["CRITICAL"] else "CONDITIONAL_APPROVAL" if RANK[highest] >= RANK["HIGH"] else "APPROVE"
+        findings = list(dict.fromkeys(sec.get("issues_found", []) + perf.get("issues_found", [])))
+        verdict = {"verdict": verdict_name, "severity": highest,
+                   "analysis_mode": analysis_mode,
+                   "promise_verified": verdict_name == "APPROVE",
+                   "conflict_resolution": "The deterministic severity policy selected the highest negotiated risk.",
+                   "key_findings": findings, "findings": [
+                       {"title": title, "description": title, "severity": highest,
+                        "category": "TribunalFinding", "line": 1,
+                        "remediation": sec.get("fix") or perf.get("fix")} for title in findings],
+                   "remediation_code": sec.get("fix") if RANK[sec["severity"]] >= RANK[perf["severity"]] else perf.get("fix")}
+        if verdict_name == "APPROVE": verdict["sbom"] = make_sbom(code, filename, state["run_id"])
+        dialogue.append({"sender": "Lead Mediator", "round": 3, "content": json.dumps(verdict), "timestamp": now()})
+        input_tokens = sec_usage["input_tokens"] + perf_usage["input_tokens"]
+        output_tokens = sec_usage["output_tokens"] + perf_usage["output_tokens"]
+        result.update({"security_r1": sec, "performance_r1": perf, "security_r2": sec_r2,
+                       "performance_r2": perf_r2, "security_severity": sec["severity"],
+                       "performance_severity": perf["severity"], "conflict_detected": conflict,
+                       "dialogue_history": dialogue, "final_verdict": verdict,
+                       "mcp_verified": sec_mcp and perf_mcp, "filename": filename,
+                       "analysis_mode": analysis_mode,
+                       "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                                 "total_tokens": input_tokens + output_tokens,
+                                 "cost_usd": estimate_cost(input_tokens, output_tokens, settings.qwen_model)}})
+        return result
 
-builder = StateGraph(TribunalState)
+    async def astream_events(self, state: dict, version: str = "v2"):
+        yield {"event": "on_chain_start", "name": "security_auditor_r1", "data": {}}
+        yield {"event": "on_chain_start", "name": "performance_analyst_r1", "data": {}}
+        result = await self.ainvoke(state)
+        yield {"event": "on_chain_end", "name": "security_auditor_r1", "data": {"output": {"round1_reports": [result["security_r1"]]}}}
+        yield {"event": "on_chain_end", "name": "performance_analyst_r1", "data": {"output": {"round1_reports": [result["performance_r1"]]}}}
+        if result["conflict_detected"]:
+            for name, key in (("security_debates", "security_r2"), ("performance_debates", "performance_r2")):
+                yield {"event": "on_chain_start", "name": name, "data": {}}
+                yield {"event": "on_chain_end", "name": name, "data": {"output": {"round2_responses": [result[key]]}}}
+        yield {"event": "on_chain_start", "name": "lead_mediator", "data": {}}
+        yield {"event": "on_chain_end", "name": "lead_mediator", "data": {"output": {"final_verdict": result["final_verdict"]}}}
+        yield {"event": "on_chain_end", "name": "LangGraph", "data": {"output": result}}
 
-builder.add_node("initialize",             initialize)
-builder.add_node("security_auditor_r1",    security_auditor_r1)
-builder.add_node("performance_analyst_r1", performance_analyst_r1)
-builder.add_node("merge_round1",           merge_round1)
-builder.add_node("security_debates",       security_debates)
-builder.add_node("performance_debates",    performance_debates)
-builder.add_node("merge_round2",           merge_round2)
-builder.add_node("lead_mediator",          lead_mediator)
 
-builder.add_edge(START, "initialize")
-builder.add_conditional_edges(
-    "initialize", fan_out_round1,
-    ["security_auditor_r1", "performance_analyst_r1"],
-)
-builder.add_edge("security_auditor_r1",    "merge_round1")
-builder.add_edge("performance_analyst_r1", "merge_round1")
-builder.add_conditional_edges(
-    "merge_round1", route_after_conflict,
-    ["security_debates", "performance_debates", "lead_mediator"],
-)
-builder.add_edge("security_debates",   "merge_round2")
-builder.add_edge("performance_debates", "merge_round2")
-builder.add_edge("merge_round2", "lead_mediator")
-builder.add_edge("lead_mediator", END)
-
-tribunal_app = builder.compile()
+tribunal_app = TribunalEngine()
