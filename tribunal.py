@@ -128,21 +128,95 @@ async def llm_report(role: str, code: str, filename: str, issue: str, evidence: 
     from langchain_openai import ChatOpenAI
     llm = ChatOpenAI(model=settings.qwen_model, api_key=settings.qwen_api_key,
                      base_url=settings.qwen_base_url, temperature=0, max_tokens=900, timeout=30)
-    prompt = (f"You are the {role} specialist. Analyze {filename}. Goal: {issue}.\n"
-              f"Tool evidence: {json.dumps(evidence)}\nCode:\n{code[:settings.max_code_chars]}\n"
-              "Return severity SAFE/LOW/MEDIUM/HIGH/CRITICAL, title, description, fix, "
-              "confidence_score, issues_found, and secrets_found as structured data.")
+    prompt = (
+        f"You are the {role} specialist. Analyze {filename}. Goal: {issue}.\n"
+        f"Tool evidence: {json.dumps(evidence)}\n"
+        f"Code:\n{code[:settings.max_code_chars]}\n"
+        "Return exactly one JSON object with these fields: "
+        "severity, title, description, fix, confidence_score, "
+        "issues_found, and secrets_found. "
+        "severity must be SAFE, LOW, MEDIUM, HIGH, or CRITICAL. "
+        "issues_found and secrets_found must be JSON arrays. "
+        "Do not use markdown fences or add text outside the JSON object."
+    )
+
     try:
-        response = await asyncio.wait_for(llm.with_structured_output(SpecialistReport).ainvoke(prompt), 45)
-        report = response.model_dump()
+        response = await asyncio.wait_for(
+            llm.ainvoke(prompt),
+            45,
+        )
+
+        content = response.content
+
+        if isinstance(content, list):
+            content = "".join(
+                block.get("text", "")
+                if isinstance(block, dict)
+                else str(block)
+                for block in content
+            )
+
+        text = str(content or "").strip()
+        text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"\s*```$", "", text)
+
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start < 0 or end <= start:
+            raise ValueError(
+                "Qwen response did not contain a JSON object"
+            )
+
+        parsed = json.loads(text[start : end + 1])
+        report = SpecialistReport.model_validate(parsed).model_dump()
         report["severity"] = severity(report["severity"])
-        # Structured-output wrappers do not consistently expose usage; record a conservative estimate.
-        usage = {"input_tokens": max(1, len(prompt) // 4), "output_tokens": max(1, len(json.dumps(report)) // 4)}
+        report["analysis_source"] = "qwen"
+
+        metadata = getattr(response, "usage_metadata", None) or {}
+
+        usage = {
+            "input_tokens": (
+                metadata.get("input_tokens")
+                or max(1, len(prompt) // 4)
+            ),
+            "output_tokens": (
+                metadata.get("output_tokens")
+                or max(1, len(json.dumps(report)) // 4)
+            ),
+        }
+
         return report, usage
-    except Exception:
-        report = local_security(code, filename) if role == "security" else local_performance(code)
-        report["description"] += " (Provider unavailable; deterministic fallback used.)"
-        return report, {"input_tokens": 0, "output_tokens": 0}
+
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        status_note = f" status={status}" if status else ""
+
+        print(
+            f"[Qwen] {role} request failed: "
+            f"{type(exc).__name__}{status_note}; "
+            "using deterministic fallback"
+        )
+
+        report = (
+            local_security(code, filename)
+            if role == "security"
+            else local_performance(code)
+        )
+        report["description"] += (
+            " (Provider unavailable; deterministic fallback used.)"
+        )
+        report["analysis_source"] = "deterministic_fallback"
+
+        return report, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
 
 
 def negotiate(own: str, other: str) -> dict:
