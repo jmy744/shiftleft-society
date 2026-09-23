@@ -186,7 +186,7 @@
   <div class="stats">
     <div class="stat"><div class="stat-label">Total analyses</div><div class="stat-value" id="s-total">—</div><div class="stat-delta" id="s-total-delta">All time</div></div>
     <div class="stat"><div class="stat-label">Approval rate</div><div class="stat-value" id="s-approval">—</div><div class="stat-delta" id="s-approval-delta">Tribunal verdicts</div></div>
-    <div class="stat"><div class="stat-label">Avg cost / PR</div><div class="stat-value" id="s-cost">—</div><div class="stat-delta" id="s-cost-delta">Qwen-Max tokens</div></div>
+    <div class="stat"><div class="stat-label">Avg cost / PR</div><div class="stat-value" id="s-cost">—</div><div class="stat-delta" id="s-cost-delta">tracked model usage</div></div>
     <div class="stat"><div class="stat-label">Avg verdict time</div><div class="stat-value" id="s-time">—</div><div class="stat-delta up" id="s-time-delta">vs hours for humans</div></div>
   </div>
 
@@ -213,7 +213,7 @@
   <div class="th-bench">
     <div class="th-bench-av">M</div>
     <div style="flex:1;">
-      <div class="th-bench-l">Lead mediator · Qwen-Max</div>
+      <div class="th-bench-l" id="th-engine">Lead mediator · analysis engine</div>
       <div class="th-bench-n">Hearing tribunal for <strong id="th-file">—</strong></div>
     </div>
     <span class="theatre-live-badge" id="th-live-badge" style="display:none;">LIVE</span>
@@ -308,7 +308,9 @@ async function api(path, opts) {
 async function checkHealth() {
   try {
     const h = await api('/health');
-    $('health-text').textContent = 'tribunal v' + h.version;
+    $('health-text').textContent = h.mode === 'llm_configured'
+      ? `${h.model} configured`
+      : `tribunal v${h.version} · offline`;
   } catch (e) {
     $('health-text').textContent = 'offline';
     $('health-pill').style.background = 'rgba(239,68,68,0.12)';
@@ -318,18 +320,12 @@ async function checkHealth() {
 
 async function loadStats() {
   try {
-    const list = await api('/analyses?limit=200');
-    const arr = list.analyses || [];
-    const total = arr.length;
-    const approved = arr.filter(a => (a.verdict || '').toUpperCase() === 'APPROVE').length;
-    const costs = arr.filter(a => a.cost_usd != null).map(a => a.cost_usd);
-    const durations = arr.filter(a => a.duration_seconds != null).map(a => a.duration_seconds);
-
-    $('s-total').textContent = total;
-    $('s-approval').textContent = total ? Math.round(approved / total * 100) + '%' : '0%';
-    $('s-cost').textContent = costs.length ? '$' + (costs.reduce((a,b) => a+b, 0) / costs.length).toFixed(3) : '$—';
-    $('s-time').textContent = durations.length ? (durations.reduce((a,b) => a+b, 0) / durations.length).toFixed(1) + 's' : '—';
-    $('s-cost-delta').textContent = costs.length ? 'across ' + costs.length + ' tracked' : 'tracking new analyses';
+    const stats = await api('/stats');
+    $('s-total').textContent = stats.total_analyses;
+    $('s-approval').textContent = stats.approval_rate_pct.toFixed(0) + '%';
+    $('s-cost').textContent = '$' + stats.avg_cost_usd.toFixed(4);
+    $('s-time').textContent = stats.avg_duration_seconds.toFixed(1) + 's';
+    $('s-cost-delta').textContent = stats.total_analyses ? 'across all tracked runs' : 'tracking new analyses';
   } catch (e) {
     console.error('stats failed', e);
   }
@@ -419,7 +415,8 @@ function buildNegotiationWidget(nego) {
   const pos = nego.position.toLowerCase();
   const spent = nego.budget_spent != null ? nego.budget_spent : 0;
   const remaining = nego.budget_remaining != null ? nego.budget_remaining : (INITIAL_BUDGET - spent);
-  const pct = Math.max(0, Math.min(100, (spent / INITIAL_BUDGET) * 100));
+  const total = nego.budget_total || INITIAL_BUDGET;
+  const pct = Math.max(0, Math.min(100, (spent / total) * 100));
   const revised = nego.revised_severity || '—';
   const original = nego.original_severity || '?';
   const arrow = original !== revised ? `${original} → ${revised}` : revised;
@@ -433,7 +430,7 @@ function buildNegotiationWidget(nego) {
       <div class="nego-bar"><div class="nego-bar-fill ${pos}" style="width:${pct}%"></div></div>
       <div class="nego-stats">
         <span>Spent <strong>${spent}</strong></span>
-        <span>Remaining <strong>${remaining}</strong> / ${INITIAL_BUDGET}</span>
+        <span>Remaining <strong>${remaining}</strong> / ${total}</span>
         ${nego.gap_tiers != null ? `<span>Gap <strong>${nego.gap_tiers}</strong> tier${nego.gap_tiers === 1 ? '' : 's'}</span>` : ''}
       </div>
     </div>
@@ -475,6 +472,7 @@ function setVerdict(data) {
   if (data.cost_usd != null) stats.push(`<div class="vc-stat">Cost <strong>$${data.cost_usd.toFixed(4)}</strong></div>`);
   if (data.duration_seconds != null) stats.push(`<div class="vc-stat">Duration <strong>${data.duration_seconds.toFixed(1)}s</strong></div>`);
   if (data.mcp_verified) stats.push(`<div class="vc-stat">MCP <strong>verified</strong></div>`);
+  if (data.analysis_mode) stats.push(`<div class="vc-stat">Mode <strong>${escapeHtml(data.analysis_mode)}</strong></div>`);
   if (data.promise_verified !== undefined) stats.push(`<div class="vc-stat">Promise <strong>${data.promise_verified ? '✓' : '✗'}</strong></div>`);
   $('vc-stats').innerHTML = stats.join('');
 
@@ -671,12 +669,21 @@ function handleStreamEvent(msg, startTimes, evt) {
     }
   } else if (t === 'complete') {
     const v = msg.verdict || {};
+    const modeLabels = {
+      qwen_guarded: 'Lead mediator · Qwen-Max + deterministic guardrails',
+      degraded_fallback: 'Lead mediator · deterministic fallback',
+      offline: 'Lead mediator · offline deterministic engine',
+    };
+    $('th-engine').textContent = modeLabels[msg.analysis_mode] || 'Lead mediator · analysis engine';
     setVerdict({
       verdict: v.verdict,
       reasoning: v.conflict_resolution || v.summary,
       remediation_code: v.remediation_code,
       duration_seconds: msg.duration_seconds,
       mcp_verified: msg.mcp_verified,
+      analysis_mode: msg.analysis_mode,
+      total_tokens: msg.usage && msg.usage.total_tokens,
+      cost_usd: msg.usage && msg.usage.cost_usd,
     });
     $('btn-submit').disabled = false;
     $('btn-submit').textContent = 'Run tribunal →';
@@ -711,7 +718,7 @@ $('btn-refresh').addEventListener('click', () => { loadAnalyses(); loadStats(); 
 $('btn-new').addEventListener('click', () => { showView('new'); $('live-strip').classList.remove('on'); });
 $('btn-submit').addEventListener('click', submitNewAnalysis);
 $('btn-sarif').addEventListener('click', () => { if (currentRunId) downloadFile(API + `/analyses/${currentRunId}/sarif`, `shiftleft-${currentRunId.slice(0,8)}.sarif`); });
-$('btn-sbom').addEventListener('click', () => { if (currentRunId) downloadFile(API + `/history/${currentRunId}/sbom`, `sbom-${currentRunId.slice(0,8)}.json`); });
+$('btn-sbom').addEventListener('click', () => { if (currentRunId) downloadFile(API + `/analyses/${currentRunId}/sbom`, `sbom-${currentRunId.slice(0,8)}.json`); });
 
 checkHealth();
 loadStats();

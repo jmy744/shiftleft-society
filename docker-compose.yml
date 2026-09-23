@@ -1,56 +1,38 @@
-# ShiftLeft Society — local dev / cloud deployment compose
-# Usage:
-#   1. Create .env file (next to this one) with: QWEN_API_KEY=sk-...
-#   2. docker compose up --build       (first time)
-#      docker compose up               (subsequent runs)
-#   3. Open http://localhost:8000 in your browser
-
 services:
-  shiftleft:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: shiftleft-tribunal
-    ports:
-      - "8000:8000"
-    environment:
-      QWEN_API_KEY: ${QWEN_API_KEY}
-      GITHUB_TOKEN: ${GITHUB_TOKEN}
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
-      MCP_PORT: "8001"
-      MCP_SERVER_URL: "http://localhost:8001/mcp"
-    # Persist the SQLite database across container rebuilds/restarts.
-    # The DB file (tribunal_history.db) is symlinked into /app/data, which is
-    # backed by the named volume below — so agent credibility history and all
-    # past analyses survive `docker compose up --build` and `down`.
-    volumes:
-      - shiftleft-data:/app/data
-    # Bootstraps the database with the v3/v4 schema before launching the API.
-    # init_db creates base tables. migrate_v3 adds total_tokens, cost_usd,
-    # duration_seconds, etc. migrate_v4 adds agent_credibility (cross-PR
-    # trust tracking). All three are idempotent — safe to run on every start.
-    command:
-      - sh
-      - -c
-      - |
-        echo "[init] Ensuring persistent data dir..." && \
-        mkdir -p /app/data && \
-        ln -sf /app/data/tribunal_history.db /app/tribunal_history.db && \
-        echo "[init] Creating base database schema..." && \
-        python -c "import asyncio, database; asyncio.run(database.init_db())" && \
-        echo "[init] Applying v3 migrations..." && \
-        python migrate_v3.py 2>&1 || true && \
-        echo "[init] Applying v4 migrations (agent credibility)..." && \
-        python migrate_v4.py 2>&1 || true && \
-        echo "[init] Starting API server..." && \
-        exec python api.py
+  app:
+    build: .
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+    env_file: [.env]
+    environment:
+      DB_PATH: /app/data/tribunal_history.db
+      MCP_SERVER_URL: http://mcp:8001/mcp
+    volumes: [shiftleft-data:/app/data]
+    expose: ["8000"]
+    ports: ["8000:8000"]
+    depends_on:
+      mcp:
+        condition: service_started
+    security_opt: [no-new-privileges:true]
+
+  mcp:
+    build: .
+    restart: unless-stopped
+    command: ["python", "mcp_server.py"]
+    environment: {MCP_PORT: "8001"}
+    expose: ["8001"]
+    security_opt: [no-new-privileges:true]
+
+  caddy:
+    image: caddy:2.8-alpine
+    profiles: [production]
+    restart: unless-stopped
+    environment: {DOMAIN: "${DOMAIN:-localhost}"}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [app]
 
 volumes:
   shiftleft-data:
+  caddy-data:
