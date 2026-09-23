@@ -44,6 +44,7 @@ class SpecialistReport(BaseModel):
 
 def severity(value: Any) -> str:
     value = str(value or "SAFE").upper().replace("NONE", "SAFE")
+    value = {"MODERATE": "MEDIUM", "SEVERE": "HIGH"}.get(value, value)
     return value if value in RANK else "SAFE"
 
 
@@ -61,6 +62,43 @@ def local_security(code: str, filename: str = "unknown") -> dict:
     for pattern, sev, title in rules:
         if re.search(pattern, code, re.I):
             issues.append((sev, title, pattern))
+    assigned_query_pattern = re.compile(
+        r'(?m)^[+-]?\s*([A-Za-z_]\w*)\s*=\s*f["\'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\n'
+        r'[\s\S]*?\.execute(?:many)?\s*\(\s*\1\s*\)',
+        re.IGNORECASE,
+    )
+    assigned_query_match = assigned_query_pattern.search(code)
+    if assigned_query_match:
+        issues.append(("CRITICAL", "SQL injection", "assigned-interpolated-query"))
+    # Detect the common two-step form: an interpolated query is assigned to a
+    # variable and that variable is later passed to execute(). A regex that
+    # only looks for execute(f"...") misses this data flow.
+    try:
+        tree = ast.parse(code)
+        interpolated_names = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Name)
+            and isinstance(node.value, (ast.JoinedStr, ast.BinOp))
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function_name = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            first_argument = node.args[0]
+            if (
+                function_name in {"execute", "executemany"}
+                and isinstance(first_argument, ast.Name)
+                and first_argument.id in interpolated_names
+            ):
+                issues.append(("CRITICAL", "SQL injection", "interpolated-query-data-flow"))
+                break
+    except SyntaxError:
+        pass
     secret_patterns = {
         "AWS access key": r"AKIA[0-9A-Z]{16}", "GitHub token": r"gh[pousr]_[A-Za-z0-9]{20,}",
         "private key": r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----",
@@ -122,101 +160,125 @@ async def call_mcp(tool: str, arguments: dict) -> tuple[dict, bool]:
 
 
 async def llm_report(role: str, code: str, filename: str, issue: str, evidence: dict) -> tuple[dict, dict]:
+    deterministic = local_security(code, filename) if role == "security" else local_performance(code)
     if not settings.use_llm:
-        report = local_security(code, filename) if role == "security" else local_performance(code)
+        report = deterministic
+        report["analysis_source"] = "deterministic_offline"
         return report, {"input_tokens": 0, "output_tokens": 0}
     from langchain_openai import ChatOpenAI
     llm = ChatOpenAI(model=settings.qwen_model, api_key=settings.qwen_api_key,
                      base_url=settings.qwen_base_url, temperature=0, max_tokens=900, timeout=30)
-    prompt = (
-        f"You are the {role} specialist. Analyze {filename}. Goal: {issue}.\n"
-        f"Tool evidence: {json.dumps(evidence)}\n"
-        f"Code:\n{code[:settings.max_code_chars]}\n"
-        "Return exactly one JSON object with these fields: "
-        "severity, title, description, fix, confidence_score, "
-        "issues_found, and secrets_found. "
-        "severity must be SAFE, LOW, MEDIUM, HIGH, or CRITICAL. "
-        "issues_found and secrets_found must be JSON arrays. "
-        "Do not use markdown fences or add text outside the JSON object."
-    )
-
+    prompt = (f"You are the {role} specialist. Analyze {filename}. Goal: {issue}.\n"
+              f"Tool evidence: {json.dumps(evidence)}\nCode:\n{code[:settings.max_code_chars]}\n"
+              "Return exactly one JSON object with severity (SAFE/LOW/MEDIUM/HIGH/CRITICAL), "
+              "title, description, fix, confidence_score, issues_found, and secrets_found. "
+              "Do not use markdown fences or add text outside the JSON object.")
     try:
-        response = await asyncio.wait_for(
-            llm.ainvoke(prompt),
-            45,
-        )
+        # Use an ordinary OpenAI-compatible chat completion instead of
+        # provider-specific structured-output APIs. DashScope's compatibility
+        # endpoint supports chat completions consistently, while JSON-schema
+        # response formats vary by model and SDK version.
+        response = None
+        for attempt in range(3):
+            try:
+                response = await asyncio.wait_for(llm.ainvoke(prompt), 45)
+                break
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                if status != 429 or attempt == 2:
+                    raise
+                # Free OpenRouter routes have deliberately conservative burst
+                # limits. Back off before retrying instead of immediately
+                # downgrading an otherwise valid analysis to local-only mode.
+                await asyncio.sleep(2 ** attempt)
 
-        content = response.content
-
-        if isinstance(content, list):
-            content = "".join(
-                block.get("text", "")
-                if isinstance(block, dict)
-                else str(block)
-                for block in content
-            )
-
-        text = str(content or "").strip()
-        text = re.sub(
-            r"^```(?:json)?\s*",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-        text = re.sub(r"\s*```$", "", text)
-
-        start = text.find("{")
-        end = text.rfind("}")
-
-        if start < 0 or end <= start:
-            raise ValueError(
-                "Qwen response did not contain a JSON object"
-            )
-
-        parsed = json.loads(text[start : end + 1])
-        report = SpecialistReport.model_validate(parsed).model_dump()
+        if response is None:  # pragma: no cover - defensive; loop either returns or raises
+            raise RuntimeError("LLM request completed without a response")
+        report = parse_specialist_response(response.content)
         report["severity"] = severity(report["severity"])
-        report["analysis_source"] = "qwen"
-
+        report = enforce_deterministic_floor(report, deterministic)
+        report["analysis_source"] = "qwen_with_deterministic_guardrail"
         metadata = getattr(response, "usage_metadata", None) or {}
-
         usage = {
-            "input_tokens": (
-                metadata.get("input_tokens")
-                or max(1, len(prompt) // 4)
-            ),
-            "output_tokens": (
-                metadata.get("output_tokens")
-                or max(1, len(json.dumps(report)) // 4)
-            ),
+            "input_tokens": metadata.get("input_tokens") or max(1, len(prompt) // 4),
+            "output_tokens": metadata.get("output_tokens") or max(1, len(json.dumps(report)) // 4),
         }
-
         return report, usage
-
     except Exception as exc:
+        # Never print credentials or request bodies. The exception class is
+        # sufficient to distinguish provider/auth/transport fallback in logs.
         status = getattr(exc, "status_code", None)
         status_note = f" status={status}" if status else ""
-
-        print(
-            f"[Qwen] {role} request failed: "
-            f"{type(exc).__name__}{status_note}; "
-            "using deterministic fallback"
-        )
-
-        report = (
-            local_security(code, filename)
-            if role == "security"
-            else local_performance(code)
-        )
-        report["description"] += (
-            " (Provider unavailable; deterministic fallback used.)"
-        )
+        print(f"[Qwen] {role} request failed: {type(exc).__name__}{status_note}; using deterministic fallback")
+        report = deterministic
+        report["description"] += " (Provider unavailable; deterministic fallback used.)"
         report["analysis_source"] = "deterministic_fallback"
+        return report, {"input_tokens": 0, "output_tokens": 0}
 
-        return report, {
-            "input_tokens": 0,
-            "output_tokens": 0,
-        }
+
+def parse_specialist_response(content: Any) -> dict:
+    """Parse a provider's JSON text without relying on proprietary schema APIs."""
+    if isinstance(content, list):
+        content = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    text = str(content or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("Qwen response did not contain a JSON object")
+    parsed = json.loads(text[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Provider response JSON must be an object")
+
+    # OpenAI-compatible providers do not all enforce JSON schemas. Normalize
+    # common harmless variations before Pydantic validates the report.
+    confidence = parsed.get("confidence_score", 80)
+    try:
+        confidence = int(float(confidence))
+    except (TypeError, ValueError):
+        confidence = 80
+    parsed["confidence_score"] = min(100, max(1, confidence))
+    parsed["severity"] = severity(parsed.get("severity"))
+    for field in ("title", "description", "fix"):
+        value = parsed.get(field)
+        if value is not None and not isinstance(value, str):
+            parsed[field] = str(value)
+    for field in ("issues_found", "secrets_found"):
+        value = parsed.get(field, [])
+        if value is None:
+            parsed[field] = []
+        elif isinstance(value, str):
+            parsed[field] = [value]
+        elif isinstance(value, list):
+            parsed[field] = [str(item) for item in value]
+        else:
+            parsed[field] = [str(value)]
+    return SpecialistReport.model_validate(parsed).model_dump()
+
+
+def enforce_deterministic_floor(model_report: dict, deterministic_report: dict) -> dict:
+    """Never let an LLM downgrade a vulnerability proven by deterministic evidence."""
+    guarded = model_report.copy()
+    model_severity = severity(guarded.get("severity"))
+    deterministic_severity = severity(deterministic_report.get("severity"))
+    if RANK[deterministic_severity] > RANK[model_severity]:
+        guarded["severity"] = deterministic_severity
+        guarded["title"] = deterministic_report.get("title") or guarded.get("title")
+        guarded["description"] = (
+            f"{guarded.get('description', '').strip()} "
+            f"Deterministic guardrail: {deterministic_report.get('description', '')}"
+        ).strip()
+        guarded["fix"] = deterministic_report.get("fix") or guarded.get("fix")
+    guarded["issues_found"] = list(dict.fromkeys(
+        deterministic_report.get("issues_found", []) + guarded.get("issues_found", [])
+    ))
+    guarded["secrets_found"] = list(dict.fromkeys(
+        deterministic_report.get("secrets_found", []) + guarded.get("secrets_found", [])
+    ))
+    return guarded
 
 
 def negotiate(own: str, other: str) -> dict:
@@ -257,10 +319,18 @@ class TribunalEngine:
         code, filename, issue = state["code"], state["filename"], state["issue_description"]
         sec_evidence, sec_mcp = await call_mcp("scan_vulnerabilities", {"code": code, "filename": filename})
         perf_evidence, perf_mcp = await call_mcp("analyze_complexity", {"code": code})
-        (sec, sec_usage), (perf, perf_usage) = await asyncio.gather(
-            llm_report("security", code, filename, issue, sec_evidence),
-            llm_report("performance", code, filename, issue, perf_evidence),
+        # Run provider calls sequentially. Free OpenRouter models commonly have
+        # low burst limits, and simultaneous specialist requests can cause one
+        # of two otherwise valid calls to receive HTTP 429.
+        sec, sec_usage = await llm_report("security", code, filename, issue, sec_evidence)
+        perf, perf_usage = await llm_report("performance", code, filename, issue, perf_evidence)
+        sources = {sec.get("analysis_source"), perf.get("analysis_source")}
+        analysis_mode = (
+            "qwen_guarded" if sources == {"qwen_with_deterministic_guardrail"}
+            else "offline" if sources == {"deterministic_offline"}
+            else "degraded_fallback"
         )
+        print(f"[Tribunal] run={state['run_id']} mode={analysis_mode} sources={sorted(sources)}")
         dialogue = [
             {"sender": "Security Auditor", "round": 1, "content": json.dumps(sec), "timestamp": now()},
             {"sender": "Performance Analyst", "round": 1, "content": json.dumps(perf), "timestamp": now()},
@@ -281,6 +351,7 @@ class TribunalEngine:
         verdict_name = "REJECT" if RANK[highest] >= RANK["CRITICAL"] else "CONDITIONAL_APPROVAL" if RANK[highest] >= RANK["HIGH"] else "APPROVE"
         findings = list(dict.fromkeys(sec.get("issues_found", []) + perf.get("issues_found", [])))
         verdict = {"verdict": verdict_name, "severity": highest,
+                   "analysis_mode": analysis_mode,
                    "promise_verified": verdict_name == "APPROVE",
                    "conflict_resolution": "The deterministic severity policy selected the highest negotiated risk.",
                    "key_findings": findings, "findings": [
@@ -297,6 +368,7 @@ class TribunalEngine:
                        "performance_severity": perf["severity"], "conflict_detected": conflict,
                        "dialogue_history": dialogue, "final_verdict": verdict,
                        "mcp_verified": sec_mcp and perf_mcp, "filename": filename,
+                       "analysis_mode": analysis_mode,
                        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
                                  "total_tokens": input_tokens + output_tokens,
                                  "cost_usd": estimate_cost(input_tokens, output_tokens, settings.qwen_model)}})
