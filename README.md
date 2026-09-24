@@ -1,532 +1,258 @@
-# ShiftLeft Society
+<div align="center">
 
-ShiftLeft Society is a multi-agent DevSecOps review system. A Security Auditor and a Performance Analyst inspect submitted code, negotiate severity differences under a deterministic confidence budget, and pass their findings to a deterministic verdict policy.
+# 🏛️ ShiftLeft Society
 
-The web console streams each stage, stores a replayable transcript, and exports SARIF 2.1.0 and CycloneDX 1.5 documents.
+### A deterministic-first, multi-agent DevSecOps tribunal
 
-## Features
+Security and performance specialists review code independently, deterministic
+guardrails preserve proven findings, and an auditable mediator produces the
+final verdict.
 
-- FastAPI REST API.
-- Server-Sent Events for live analysis.
-- Responsive browser console.
-- Qwen-Max structured specialist reports.
-- Deterministic offline scanner fallback.
-- Deterministic severity guardrails for Qwen results.
-- Security and performance specialist agents.
-- Confidence-budget negotiation.
-- Persistent SQLite analysis history.
-- Transcript replay.
-- SARIF 2.1.0 export.
-- CycloneDX 1.5 SBOM export.
-- GitHub pull-request webhook integration.
-- Optional API-key protection.
-- Request-size and concurrency limits.
-- Docker and Docker Compose deployment.
-- Optional Caddy HTTPS reverse proxy.
-- Automated offline tests.
-- GitHub Actions CI.
+[![CI](https://github.com/jmy744/shiftleft-society/actions/workflows/ci.yml/badge.svg)](https://github.com/jmy744/shiftleft-society/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
+[![Model](https://img.shields.io/badge/model-configurable%20Qwen-8A2BE2)](#model-provider)
+[![Live demo](https://img.shields.io/badge/live-Render-46E3B7)](https://shiftleft-society.onrender.com)
+
+**[Open the live demo](https://shiftleft-society.onrender.com)**
+
+</div>
+
+---
+
+## Why this exists
+
+LLMs are useful code reviewers, but they are probabilistic and can miss or
+downgrade concrete vulnerabilities. Traditional pattern scanners are
+predictable, but often lack context and useful remediation.
+
+ShiftLeft Society combines both approaches:
+
+> **The model explains; deterministic evidence sets the safety floor.**
+
+- A **Security Auditor** looks for exploitable behavior.
+- A **Performance Analyst** identifies scalability and resource risks.
+- Local scanners independently detect known-dangerous patterns.
+- A deterministic negotiation policy resolves disagreement.
+- The result is streamed, persisted, replayable, and exportable.
+
+This is not a replacement for CodeQL, Semgrep, or a human security review. It is
+a production-minded demonstration of how an LLM can assist those controls
+without becoming the only control.
+
+## What is working
+
+- Real Qwen inference through an OpenAI-compatible provider (OpenRouter in the
+  hosted demo)
+- Deterministic security and performance checks
+- A severity floor that prevents model downgrades of proven findings
+- Bounded retry/backoff for HTTP 429 responses
+- Deterministic offline and provider-failure fallbacks
+- Confidence-budget negotiation (`DEFEND`, `PARTIAL`, `CONCEDE`)
+- Live Server-Sent Events (SSE) transcript
+- SQLite analysis history and replay
+- SARIF 2.1.0 and CycloneDX SBOM exports
+- Signed GitHub webhook ingestion
+- Docker deployment and GitHub Actions CI
 
 ## Architecture
 
 ```text
-Browser / GitHub
-       |
-       | HTTPS
-       v
-Caddy or Render
-       |
-       v
-FastAPI web application
-       |
-       +-------------------+
-       |                   |
-       v                   v
-Security Auditor    Performance Analyst
-       |                   |
-       +---------+---------+
-                 |
-                 v
-       Deterministic negotiation
-                 |
-                 v
-       Deterministic verdict policy
-                 |
-       +---------+----------+
-       |                    |
-       v                    v
- SQLite history      SARIF / CycloneDX
-                 |
-                 v
-       Optional Qwen-Max and MCP
+Browser / GitHub webhook
+          │
+          ▼
+┌───────────────────────────────┐
+│ FastAPI                       │
+│ REST · SSE · API key · HMAC   │
+└──────────────┬────────────────┘
+               │ background job
+               ▼
+┌───────────────────────────────────────────────┐
+│ Tribunal engine                               │
+│                                               │
+│  deterministic scan ───────┐                  │
+│  security specialist ──────┼─► guardrail      │
+│  performance specialist ───┘   + negotiation  │
+│                                      │        │
+│                                      ▼        │
+│                              mediator verdict │
+└──────────────┬───────────────────────┬────────┘
+               │                       │
+               ▼                       ▼
+       SQLite history          OpenRouter / Qwen
+       replay · SARIF · SBOM    (optional)
 ```
 
-## Analysis modes
+Provider calls are intentionally sequential in the hosted free-tier
+configuration to avoid burst-rate failures. Local deterministic analysis still
+runs when the provider or MCP service is unavailable.
 
-### Offline mode
+## Request lifecycle
 
-Set:
+1. `POST /analyze/start` validates the code and creates a queued analysis.
+2. The tribunal gathers local/MCP evidence.
+3. Security and performance specialists produce structured reports.
+4. Deterministic findings are merged into each report and establish a severity
+   floor.
+5. If severities differ, deterministic confidence-budget negotiation runs.
+6. The mediator selects the highest negotiated risk and produces remediation.
+7. The API persists the result and streams progress to the browser.
+8. The result can be replayed or exported as SARIF/SBOM.
 
-```dotenv
-OFFLINE_MODE=true
-```
+## Safety and reliability
 
-Offline mode:
+### Deterministic guardrail
 
-- Does not require a Qwen API key.
-- Does not consume model credits.
-- Uses deterministic local scanners.
-- Is suitable for development, tests, and free demonstrations.
+The current local scanner covers representative high-signal patterns,
+including SQL injection, dynamic code execution, shell execution, unsafe
+deserialization, unsafe YAML, disabled TLS verification, secrets, and unpinned
+GitHub Actions.
 
-### Qwen mode
+If deterministic evidence is more severe than the model response, the local
+severity wins and its findings are merged into the report.
 
-Set:
+### Provider resilience
 
-```dotenv
-OFFLINE_MODE=false
-QWEN_API_KEY=your-secret-key
-QWEN_MODEL=qwen-max
-QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-```
+- Up to three attempts for HTTP 429 responses with bounded exponential backoff
+- Normalization of common JSON variations before Pydantic validation
+- Deterministic fallback if authentication, transport, parsing, or model calls
+  ultimately fail
+- Per-run mode: `qwen_guarded`, `degraded_fallback`, or `offline`
 
-Qwen mode:
+### API security
 
-- Uses Qwen for structured Security Auditor and Performance Analyst reports.
-- Retains deterministic scanners as guardrails.
-- Prevents Qwen from lowering a severity proven by deterministic evidence.
-- Falls back to local scanning if the provider fails.
+- Optional `X-API-Key` protection through `SHIFTLEFT_API_KEY`
+- Constant-time key comparison
+- GitHub webhook HMAC-SHA256 verification
+- Configurable CORS origins and input-size limits
+- Secrets loaded from environment variables, never source control
 
-Never commit a real Qwen API key to GitHub.
+## Quick start
 
-## Verdict policy
-
-The final verdict is calculated by deterministic Python policy:
-
-| Highest negotiated severity | Final verdict |
-|---|---|
-| `CRITICAL` | `REJECT` |
-| `HIGH` | `CONDITIONAL_APPROVAL` |
-| `MEDIUM` | `APPROVE` |
-| `LOW` | `APPROVE` |
-| `SAFE` | `APPROVE` |
-
-The model provides specialist reasoning and remediation guidance, but it does not have unrestricted control over the final verdict.
-
-## Local installation
-
-### Requirements
-
-- Python 3.11 or newer.
-- Git.
-- Optional Docker and Docker Compose.
-
-### Create a virtual environment
-
-Linux or macOS:
+### 1. Install
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows Command Prompt:
-
-```cmd
-py -3.11 -m venv .venv
-.venv\Scripts\activate.bat
-```
-
-Python 3.13 can also be used if all dependencies install successfully:
-
-```cmd
-py -3.13 -m venv .venv
-.venv\Scripts\activate.bat
-```
-
-### Install dependencies
-
-```bash
-python -m pip install --upgrade pip
+git clone https://github.com/jmy744/shiftleft-society.git
+cd shiftleft-society
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Create local configuration
-
-Create `.env`:
-
-```dotenv
-APP_ENV=development
-OFFLINE_MODE=true
-DB_PATH=tribunal_history.db
-SHIFTLEFT_API_KEY=
-ALLOWED_ORIGINS=http://localhost:8000
-MAX_CODE_CHARS=100000
-MAX_CONCURRENT_JOBS=4
-```
-
-### Start the application
+### 2. Configure
 
 ```bash
-python api.py
+cp .env.example .env
 ```
 
-Open:
+For the same OpenRouter configuration used by the hosted demo:
 
-```text
-http://localhost:8000
+```dotenv
+QWEN_API_KEY=sk-or-v1-your-key
+QWEN_MODEL=qwen/qwen3.8-27b:free
+QWEN_BASE_URL=https://openrouter.ai/api/v1
+OFFLINE_MODE=false
 ```
 
-## Test examples
+Never commit `.env` or paste a real key into an issue, screenshot, source file,
+or pull request.
 
-### Vulnerable SQL example
+To run without any external model:
 
-```python
-import sqlite3
-
-def get_user(user_id):
-    db = sqlite3.connect("app.db")
-    return db.execute(
-        f"SELECT * FROM users WHERE id='{user_id}'"
-    ).fetchall()
+```dotenv
+OFFLINE_MODE=true
+QWEN_API_KEY=
 ```
 
-Expected result:
+### 3. Run
 
-```text
-Security severity: CRITICAL
-Final verdict: REJECT
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-### Assigned-query SQL example
+Open <http://localhost:8000>.
 
-```python
-import sqlite3
+### Docker
 
-def get_user(user_id):
-    db = sqlite3.connect("app.db")
-    query = f"SELECT * FROM users WHERE id='{user_id}'"
-    db.execute(query)
-    return db.execute("SELECT * FROM users").fetchall()
+```bash
+docker build -t shiftleft-society .
+docker run --rm -p 8000:8000 --env-file .env shiftleft-society
 ```
 
-Expected result:
+## Model provider
 
-```text
-Security severity: CRITICAL
-Final verdict: REJECT
-```
+The variable names retain the `QWEN_` prefix for backward compatibility, but
+the endpoint is configurable and must support OpenAI-compatible chat
+completions.
 
-### Safe parameterized query
-
-```python
-import sqlite3
-
-def get_user(user_id):
-    db = sqlite3.connect("app.db")
-    return db.execute(
-        "SELECT * FROM users WHERE id = ?",
-        (user_id,)
-    ).fetchone()
-```
-
-Expected result:
-
-```text
-Final verdict: APPROVE
-```
-
-### Simple safe function
-
-```python
-def add(a, b):
-    return a + b
-```
-
-Expected result:
-
-```text
-Final verdict: APPROVE
-```
-
-## Health endpoint
-
-Open:
-
-```text
-http://localhost:8000/health
-```
-
-Offline response:
-
-```json
-{
-  "status": "ok",
-  "version": "3.0.0",
-  "mode": "offline"
-}
-```
-
-Qwen-configured response:
-
-```json
-{
-  "status": "ok",
-  "version": "3.0.0",
-  "mode": "llm"
-}
-```
-
-A health response of `"mode": "llm"` means Qwen is configured. Individual analyses can still use deterministic fallback if the provider request fails.
-
-## API endpoints
-
-| Method | Path | Purpose |
+| Variable | Purpose | Hosted-demo value |
 |---|---|---|
-| `GET` | `/health` | Service health and configured analysis mode |
-| `POST` | `/analyze/start` | Start a code analysis |
-| `GET` | `/analyze/stream/{id}` | Stream live analysis events |
-| `GET` | `/analyses` | List recent analyses |
-| `GET` | `/analyses/{id}` | Read analysis status |
-| `GET` | `/analyses/{id}/replay` | Read the normalized transcript |
-| `GET` | `/analyses/{id}/sarif` | Download SARIF |
-| `GET` | `/analyses/{id}/sbom` | Download CycloneDX for approved code |
-| `GET` | `/stats` | Read dashboard statistics |
+| `QWEN_API_KEY` | Provider secret | OpenRouter key (`sk-or-v1-…`) |
+| `QWEN_MODEL` | Provider model ID | `qwen/qwen3.8-27b:free` |
+| `QWEN_BASE_URL` | OpenAI-compatible base URL | `https://openrouter.ai/api/v1` |
+| `OFFLINE_MODE` | Disable all LLM calls | `false` |
+
+`GET /health` reports configuration, not a verified provider connection. A
+completed run is authoritative: `qwen_guarded` means both specialist responses
+were used; `degraded_fallback` means at least one specialist fell back locally.
+
+## API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | Service and provider-configuration status |
+| `POST` | `/analyze/start` | Queue a new analysis |
+| `GET` | `/analyze/stream/{run_id}` | Stream live SSE events |
+| `GET` | `/analyses` | List analysis history |
+| `GET` | `/analyses/{run_id}/replay` | Replay the transcript |
+| `GET` | `/analyses/{run_id}/sarif` | Download SARIF 2.1.0 |
+| `GET` | `/analyses/{run_id}/sbom` | Download CycloneDX SBOM |
 | `POST` | `/webhook/github` | Receive signed GitHub PR events |
 
-## API example
+When `SHIFTLEFT_API_KEY` is configured, send it as `X-API-Key` to protected
+endpoints.
 
-Start an analysis:
-
-```bash
-response=$(curl -sS http://localhost:8000/analyze/start \
-  -H 'Content-Type: application/json' \
-  -d '{"filename":"demo.py","issue_description":"Review user lookup","code":"db.execute(f\"SELECT * FROM users WHERE id={uid}\")"}')
-```
-
-Extract the run ID:
+## Testing
 
 ```bash
-run_id=$(printf '%s' "$response" |
-  python -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')
-```
-
-Stream events:
-
-```bash
-curl -N "http://localhost:8000/analyze/stream/$run_id"
-```
-
-Replay the analysis:
-
-```bash
-curl -sS "http://localhost:8000/analyses/$run_id/replay" |
-  python -m json.tool
-```
-
-Download SARIF:
-
-```bash
-curl -sS "http://localhost:8000/analyses/$run_id/sarif" \
-  -o result.sarif
-```
-
-If `SHIFTLEFT_API_KEY` is configured, add:
-
-```bash
--H 'X-API-Key: your-value'
-```
-
-to protected API requests.
-
-## Docker deployment
-
-Create `.env`:
-
-```dotenv
-APP_ENV=production
-OFFLINE_MODE=true
-SHIFTLEFT_API_KEY=
-ALLOWED_ORIGINS=http://localhost:8000
-MAX_CODE_CHARS=100000
-MAX_CONCURRENT_JOBS=4
-```
-
-Start:
-
-```bash
-docker compose up --build -d
-```
-
-Check health:
-
-```bash
-curl -fsS http://localhost:8000/health
-```
-
-Inspect logs:
-
-```bash
-docker compose logs --tail=100 app mcp
-```
-
-Stop:
-
-```bash
-docker compose down
-```
-
-SQLite data is stored in the `shiftleft-data` named volume.
-
-To delete the stored volume:
-
-```bash
-docker compose down -v
-```
-
-## Render deployment
-
-Create a Render Docker Web Service from this repository.
-
-Recommended free-demo environment variables:
-
-```dotenv
-APP_ENV=production
-OFFLINE_MODE=true
-DB_PATH=/app/data/tribunal_history.db
-ALLOWED_ORIGINS=*
-MAX_CODE_CHARS=100000
-MAX_CONCURRENT_JOBS=2
-```
-
-For Qwen mode, change and add:
-
-```dotenv
-OFFLINE_MODE=false
-QWEN_API_KEY=your-secret-key
-QWEN_MODEL=qwen-max
-QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-```
-
-Set the Render health-check path to:
-
-```text
-/health
-```
-
-The free Render filesystem is temporary. Analysis history may be lost after restart or redeployment.
-
-## HTTPS deployment with Docker Compose
-
-For a server with a public domain, configure:
-
-```dotenv
-APP_ENV=production
-DOMAIN=review.example.com
-OFFLINE_MODE=false
-QWEN_API_KEY=your-secret-key
-QWEN_MODEL=qwen-max
-SHIFTLEFT_API_KEY=
-GITHUB_TOKEN=
-GITHUB_WEBHOOK_SECRET=
-ALLOWED_ORIGINS=https://review.example.com
-```
-
-Then run:
-
-```bash
-sudo ./deploy.sh
-```
-
-The production Compose profile starts Caddy on ports 80 and 443.
-
-## GitHub integration
-
-1. Set `GITHUB_WEBHOOK_SECRET`.
-2. Optionally set `GITHUB_TOKEN` so the system can post PR comments.
-3. Configure the same webhook secret in GitHub.
-4. Use:
-
-```text
-https://your-deployment/webhook/github
-```
-
-as the webhook URL.
-
-5. Select pull-request events.
-
-The webhook:
-
-- Fails closed when no secret is configured.
-- Verifies `X-Hub-Signature-256`.
-- Accepts `opened`, `reopened`, and `synchronize`.
-- Restricts diff downloads to GitHub HTTPS URLs.
-
-## Automated tests
-
-Install pytest:
-
-```bash
-pip install pytest
-```
-
-Run:
-
-```bash
-OFFLINE_MODE=true pytest -q
-```
-
-Compile-check the repository:
-
-```bash
-python -m compileall -q .
-```
-
-The test suite covers:
-
-- Analysis creation.
-- SSE streaming.
-- Vulnerable-code rejection.
-- Assigned-query SQL-injection rejection.
-- Qwen deterministic severity guardrails.
-- Safe-code approval.
-- Transcript replay.
-- SARIF export.
-- CycloneDX export.
-- Statistics.
-- Webhook authentication.
-- Deterministic negotiation.
-
-## Continuous integration
-
-GitHub Actions runs:
-
-```bash
-pip install -r requirements.txt pytest
 python -m compileall -q .
 OFFLINE_MODE=true pytest -q
 docker build -t shiftleft-society:test .
 ```
 
-on pushes and pull requests.
+Offline tests are deterministic and do not consume provider tokens.
 
-## Benchmark
+## Cost reporting
 
-`benchmark.py` is an optional live-provider benchmark.
+The dashboard displays a local estimate based on the configured model name. It
+is useful for comparing runs, but it is **not an invoice**. Provider activity
+and billing dashboards are the source of truth. Model identifiers ending in
+`:free` are estimated at `$0.00` locally.
 
-It consumes Qwen API credits and is not part of the offline CI workflow.
+## Repository map
 
-## Security and operational notes
+```text
+api.py                    FastAPI gateway, jobs, SSE, webhook, exports
+tribunal.py               specialists, scanners, guardrails, negotiation
+database.py               async SQLite schema and repository
+settings.py               environment-driven configuration
+mcp_server.py             optional MCP analysis tools
+sarif_export.py            SARIF 2.1.0 conversion
+index.html                dashboard and live tribunal theatre
+tests/test_system.py       offline integration tests
+.github/workflows/ci.yml  compile, test, and Docker checks
+```
 
-- Never commit `.env`.
-- Never commit API keys or webhook secrets.
-- Rotate any key exposed in logs, screenshots, commits, or chat.
-- Submitted source is stored in SQLite for replay.
-- Define a retention policy before accepting sensitive code.
-- Scanner output is review assistance, not proof that code has no vulnerabilities.
-- SQLite is suitable for a single application replica.
-- Use PostgreSQL and a durable job queue before horizontal scaling.
-- The free Render filesystem is temporary.
-- Confirm current Qwen pricing before financial reporting.
+## Known limitations
+
+- Pattern checks are intentionally focused and do not replace full static or
+  data-flow analysis.
+- Free provider routes may be slower or rate-limited.
+- SQLite requires a persistent disk in production if history must survive
+  instance replacement.
+- Cost figures are estimates.
+- SBOM components are inferred from source imports, not a package lockfile.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE)

@@ -1,10 +1,9 @@
 """
 cost_tracker.py
-Track Qwen API token consumption per analysis and convert to USD.
+Track model token consumption per analysis and estimate USD cost.
 
-Qwen-Max pricing (as of June 2026, per Alibaba Cloud Model Studio):
-  Input:  $1.40 per 1M tokens
-  Output: $5.60 per 1M tokens
+This is a local estimate, not an invoice. Provider billing is authoritative.
+Models whose identifier ends in ``:free`` are reported as zero cost.
 
 Usage:
     from cost_tracker import CostTracker
@@ -31,7 +30,10 @@ class CostTracker:
         self.output_tokens = 0
         self.call_count = 0
 
-        if model.startswith("qwen-turbo"):
+        if model.endswith(":free"):
+            self._in_price = 0.0
+            self._out_price = 0.0
+        elif model.startswith("qwen-turbo"):
             self._in_price = QWEN_TURBO_INPUT_PRICE
             self._out_price = QWEN_TURBO_OUTPUT_PRICE
         else:
