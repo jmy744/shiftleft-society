@@ -186,7 +186,7 @@
   <div class="stats">
     <div class="stat"><div class="stat-label">Total analyses</div><div class="stat-value" id="s-total">—</div><div class="stat-delta" id="s-total-delta">All time</div></div>
     <div class="stat"><div class="stat-label">Approval rate</div><div class="stat-value" id="s-approval">—</div><div class="stat-delta" id="s-approval-delta">Tribunal verdicts</div></div>
-    <div class="stat"><div class="stat-label">Avg cost / PR</div><div class="stat-value" id="s-cost">—</div><div class="stat-delta" id="s-cost-delta">Qwen-Max tokens</div></div>
+    <div class="stat"><div class="stat-label">Estimated cost / run</div><div class="stat-value" id="s-cost">—</div><div class="stat-delta" id="s-cost-delta">local estimate · provider billing may differ</div></div>
     <div class="stat"><div class="stat-label">Avg verdict time</div><div class="stat-value" id="s-time">—</div><div class="stat-delta up" id="s-time-delta">vs hours for humans</div></div>
   </div>
 
@@ -213,13 +213,13 @@
   <div class="th-bench">
     <div class="th-bench-av">M</div>
     <div style="flex:1;">
-      <div class="th-bench-l">Lead mediator · Qwen-Max</div>
+      <div class="th-bench-l" id="th-engine">Lead mediator · analysis engine</div>
       <div class="th-bench-n">Hearing tribunal for <strong id="th-file">—</strong></div>
     </div>
     <span class="theatre-live-badge" id="th-live-badge" style="display:none;">LIVE</span>
   </div>
 
-  <div class="th-round" id="th-round">Round 1 · parallel findings</div>
+  <div class="th-round" id="th-round">Round 1 · specialist findings</div>
 
   <div class="transcript" id="transcript"></div>
 
@@ -292,6 +292,7 @@ const views = { console: $('view-console'), theatre: $('view-theatre'), new: $('
 let allAnalyses = [];
 let currentFilter = 'all';
 let currentRunId = null;
+let configuredModel = 'configured model';
 
 function showView(name) {
   Object.values(views).forEach(v => v.classList.remove('active'));
@@ -308,7 +309,11 @@ async function api(path, opts) {
 async function checkHealth() {
   try {
     const h = await api('/health');
-    $('health-text').textContent = 'tribunal v' + h.version;
+    const llmEnabled = h.mode === 'llm_configured' || h.mode === 'llm';
+    configuredModel = h.model || configuredModel;
+    $('health-text').textContent = llmEnabled
+      ? (h.model ? `${h.model} ready` : 'LLM ready')
+      : `tribunal v${h.version || '3.0.0'} · offline`;
   } catch (e) {
     $('health-text').textContent = 'offline';
     $('health-pill').style.background = 'rgba(239,68,68,0.12)';
@@ -323,7 +328,9 @@ async function loadStats() {
     $('s-approval').textContent = stats.approval_rate_pct.toFixed(0) + '%';
     $('s-cost').textContent = '$' + stats.avg_cost_usd.toFixed(4);
     $('s-time').textContent = stats.avg_duration_seconds.toFixed(1) + 's';
-    $('s-cost-delta').textContent = stats.total_analyses ? 'across all tracked runs' : 'tracking new analyses';
+    $('s-cost-delta').textContent = stats.total_analyses
+      ? 'local estimate across tracked runs'
+      : 'local estimate · provider billing may differ';
   } catch (e) {
     console.error('stats failed', e);
   }
@@ -402,7 +409,7 @@ async function loadAnalyses() {
 function clearTheatre() {
   $('transcript').innerHTML = '';
   $('verdict-card').classList.remove('show');
-  $('th-round').textContent = 'Round 1 · parallel findings';
+  $('th-round').textContent = 'Round 1 · specialist findings';
   $('th-round').classList.remove('negotiation');
   $('vc-fix').style.display = 'none';
 }
@@ -467,9 +474,10 @@ function setVerdict(data) {
 
   const stats = [];
   if (data.total_tokens) stats.push(`<div class="vc-stat">Tokens <strong>${data.total_tokens.toLocaleString()}</strong></div>`);
-  if (data.cost_usd != null) stats.push(`<div class="vc-stat">Cost <strong>$${data.cost_usd.toFixed(4)}</strong></div>`);
+  if (data.cost_usd != null) stats.push(`<div class="vc-stat" title="Local estimate; provider billing is authoritative">Est. cost <strong>$${data.cost_usd.toFixed(4)}</strong></div>`);
   if (data.duration_seconds != null) stats.push(`<div class="vc-stat">Duration <strong>${data.duration_seconds.toFixed(1)}s</strong></div>`);
   if (data.mcp_verified) stats.push(`<div class="vc-stat">MCP <strong>verified</strong></div>`);
+  if (data.analysis_mode) stats.push(`<div class="vc-stat">Mode <strong>${escapeHtml(data.analysis_mode)}</strong></div>`);
   if (data.promise_verified !== undefined) stats.push(`<div class="vc-stat">Promise <strong>${data.promise_verified ? '✓' : '✗'}</strong></div>`);
   $('vc-stats').innerHTML = stats.join('');
 
@@ -666,12 +674,19 @@ function handleStreamEvent(msg, startTimes, evt) {
     }
   } else if (t === 'complete') {
     const v = msg.verdict || {};
+    const modeLabels = {
+      qwen_guarded: `Lead mediator · ${configuredModel} + deterministic guardrails`,
+      degraded_fallback: 'Lead mediator · deterministic fallback',
+      offline: 'Lead mediator · offline deterministic engine',
+    };
+    $('th-engine').textContent = modeLabels[msg.analysis_mode] || 'Lead mediator · analysis engine';
     setVerdict({
       verdict: v.verdict,
       reasoning: v.conflict_resolution || v.summary,
       remediation_code: v.remediation_code,
       duration_seconds: msg.duration_seconds,
       mcp_verified: msg.mcp_verified,
+      analysis_mode: msg.analysis_mode,
       total_tokens: msg.usage && msg.usage.total_tokens,
       cost_usd: msg.usage && msg.usage.cost_usd,
     });
