@@ -13,7 +13,12 @@ Tools exposed:
 import re
 import ast
 import json
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+    MCP_V2 = False
+except ModuleNotFoundError:
+    from mcp.server.mcpserver import MCPServer as FastMCP
+    MCP_V2 = True
 
 mcp = FastMCP("ShiftLeft Security Scanner")
 
@@ -31,7 +36,13 @@ def scan_vulnerabilities(code: str, filename: str = "unknown.py") -> str:
 
     # CWE-89: SQL Injection via f-string interpolation
     sqli_matches = list(re.finditer(r'execute\s*\(\s*f["\']', code))
-    if sqli_matches:
+    assigned_fstring_query = re.search(
+        r'(?m)^\s*([A-Za-z_]\w*)\s*=\s*f["\'][^\n]*(?:SELECT|INSERT|UPDATE|DELETE)[^\n]*\n'
+        r'[\s\S]*?\.execute\s*\(\s*\1\s*\)',
+        code,
+        re.IGNORECASE,
+    )
+    if sqli_matches or assigned_fstring_query:
         findings.append({
             "cwe": "CWE-89",
             "type": "SQL_INJECTION",
@@ -266,8 +277,10 @@ def analyze_complexity(code: str) -> str:
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("MCP_PORT", 8001))
-    # FastMCP 1.x: set host/port via the settings object (mutable Pydantic model)
-    mcp.settings.port = port
-    mcp.settings.host = "0.0.0.0"
     print(f"🔧 ShiftLeft MCP Security Server starting on port {port}...")
-    mcp.run(transport="streamable-http")
+    if MCP_V2:
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    else:
+        mcp.settings.port = port
+        mcp.settings.host = "0.0.0.0"
+        mcp.run(transport="streamable-http")

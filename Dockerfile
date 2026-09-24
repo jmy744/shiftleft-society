@@ -1,32 +1,16 @@
-# ShiftLeft Society — Tribunal container
-# Multi-stage build kept simple. Python 3.11 slim base.
-# Single container runs both api.py (port 8000) and mcp_server (port 8001 internal).
+FROM python:3.11.10-slim
 
-FROM python:3.11-slim
-
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8000 \
+    DB_PATH=/app/data/tribunal_history.db
 WORKDIR /app
 
-# System deps (gcc for any C extensions during pip install; cleaned up after)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python deps first (cached layer — only rebuilds if requirements.txt changes)
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Copy app code
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 COPY . .
+RUN useradd --create-home --uid 10001 shiftleft && mkdir -p /app/data && chown -R shiftleft:shiftleft /app
+USER shiftleft
 
-# Unbuffered stdout so docker logs work in real time
-ENV PYTHONUNBUFFERED=1
-
-# Default MCP env (overridden by docker-compose if needed)
-ENV MCP_PORT=8001
-ENV MCP_SERVER_URL=http://localhost:8001/mcp
-
-# Only the public API port is exposed; MCP stays internal
 EXPOSE 8000
-
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
 CMD ["python", "api.py"]

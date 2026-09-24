@@ -20,8 +20,9 @@ the exact blocking-call fix already applied to api.py's PR diff fetch
 import sqlite3
 import asyncio
 from datetime import datetime, timezone
+from settings import settings
 
-DB_PATH = "tribunal_history.db"
+DB_PATH = settings.db_path
 
 MIN_BUDGET_BONUS = -15
 MAX_BUDGET_BONUS = 15
