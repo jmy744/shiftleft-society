@@ -1,28 +1,23 @@
 """
 ShiftLeft Society — Single-Agent Baseline
-One Qwen-Max call, no tools, no structured output, no debate.
-Used by benchmark.py to compute the efficiency gain of the tribunal.
+One configured Qwen 3.8 call, without tools or negotiation.
 """
-import os
 from openai import OpenAI
+from settings import settings
 
 client = OpenAI(
-    api_key=os.environ["QWEN_API_KEY"],
-    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    api_key=settings.qwen_api_key,
+    base_url=settings.qwen_base_url,
 )
 
 def run_baseline(code: str, filename: str = "unknown.py") -> str:
     """
     Returns 'VULNERABLE' or 'SAFE'.
-    Limitations vs tribunal:
-    - No MCP tool calls (no Semgrep, no secrets scanner, no AST profiler)
-    - No parallel specialist agents
-    - No adversarial debate to surface edge cases
-    - No structured Pydantic output — just raw text
-    - Misses compound vulnerabilities (security + performance interaction)
+    This baseline uses one model response with no deterministic guardrail,
+    MCP evidence, specialist roles, or structured Pydantic report.
     """
     resp = client.chat.completions.create(
-        model="qwen-max",
+        model=settings.qwen_model,
         messages=[
             {
                 "role": "system",

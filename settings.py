@@ -17,10 +17,12 @@ class Settings:
     app_env: str = os.getenv("APP_ENV", "development")
     db_path: str = os.getenv("DB_PATH", "tribunal_history.db")
     qwen_api_key: str = os.getenv("QWEN_API_KEY", "")
-    qwen_model: str = os.getenv("QWEN_MODEL", "qwen-max")
+    qwen_model: str = os.getenv("QWEN_MODEL", "qwen/qwen3.8-27b:free")
     qwen_base_url: str = os.getenv(
-        "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        "QWEN_BASE_URL", "https://openrouter.ai/api/v1"
     )
+    qwen_input_price_per_million: float = float(os.getenv("QWEN_INPUT_PRICE_PER_MILLION", "0"))
+    qwen_output_price_per_million: float = float(os.getenv("QWEN_OUTPUT_PRICE_PER_MILLION", "0"))
     mcp_url: str = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8001/mcp")
     mcp_port: int = int(os.getenv("MCP_PORT", "8001"))
     github_token: str = os.getenv("GITHUB_TOKEN", "")

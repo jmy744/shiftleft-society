@@ -118,7 +118,9 @@ async def start_job(payload: CodePayload, trigger: str = "web", repo: str | None
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": app.version, "mode": "llm" if settings.use_llm else "offline"}
+    return {"status": "ok", "version": app.version,
+            "mode": "llm" if settings.use_llm else "offline",
+            "model": settings.qwen_model}
 
 
 @app.post("/analyze/start", dependencies=[Depends(require_api_key)])

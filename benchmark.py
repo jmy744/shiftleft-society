@@ -7,13 +7,14 @@ results to benchmark_results.json for the hackathon submission.
 Run: python benchmark.py
 """
 
-import os, json, time, asyncio
+import json, time, asyncio
 from openai import OpenAI
+from settings import settings
 from tribunal import tribunal_app
 
 client = OpenAI(
-    api_key=os.environ["QWEN_API_KEY"],
-    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    api_key=settings.qwen_api_key,
+    base_url=settings.qwen_base_url,
 )
 
 TEST_CASES = [
@@ -185,7 +186,7 @@ TEST_CASES = [
 
 def run_baseline(code: str) -> str:
     resp = client.chat.completions.create(
-        model="qwen-max",
+        model=settings.qwen_model,
         messages=[
             {"role": "system", "content": "You are a code reviewer. Reply with VULNERABLE or SAFE."},
             {"role": "user",   "content": f"Is this code vulnerable?\n```\n{code}\n```\nReply with exactly one word: VULNERABLE or SAFE."}
@@ -263,6 +264,7 @@ async def main():
     tribunal_acc = round(tribunal_correct_count / n * 100, 1)
 
     summary = {
+        "model": settings.qwen_model,
         "total_cases": n,
         "baseline_accuracy": baseline_acc,
         "tribunal_accuracy": tribunal_acc,

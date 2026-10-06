@@ -2,134 +2,93 @@
 
 # 🏛️ ShiftLeft Society
 
-### A deterministic-first, multi-agent DevSecOps tribunal
-
-Security and performance specialists review code independently, deterministic
-guardrails preserve proven findings, and an auditable mediator produces the
-final verdict.
+### Code review with Qwen 3.8, deterministic guardrails, and an auditable verdict
 
 [![CI](https://github.com/jmy744/shiftleft-society/actions/workflows/ci.yml/badge.svg)](https://github.com/jmy744/shiftleft-society/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
-[![Model](https://img.shields.io/badge/model-configurable%20Qwen-8A2BE2)](#model-provider)
-[![Live demo](https://img.shields.io/badge/live-Render-46E3B7)](https://shiftleft-society.onrender.com)
+[![Model: Qwen 3.8](https://img.shields.io/badge/model-Qwen%203.8-8A2BE2)](#model-and-provider)
 
-**[Open the live demo](https://shiftleft-society.onrender.com)**
+[Open the hosted demo](https://shiftleft-society.onrender.com)
 
 </div>
 
----
+## The problem
 
-## Why this exists
+AI code reviewers can overlook vulnerabilities or assign too little severity to
+unsafe code. Rule-based scanners provide consistent checks, but often lack
+context and useful explanations. ShiftLeft Society combines specialist model
+reviews with local security and performance checks so detected risks remain
+visible in the final decision.
 
-LLMs are useful code reviewers, but they are probabilistic and can miss or
-downgrade concrete vulnerabilities. Traditional pattern scanners are
-predictable, but often lack context and useful remediation.
+**The model explains; deterministic findings establish the severity floor.**
 
-ShiftLeft Society combines both approaches:
+The project demonstrates an inspectable review workflow. Its focused scanners
+do not replace comprehensive static analysis or human review.
 
-> **The model explains; deterministic evidence sets the safety floor.**
+## What it does
 
-- A **Security Auditor** looks for exploitable behavior.
-- A **Performance Analyst** identifies scalability and resource risks.
-- Local scanners independently detect known-dangerous patterns.
-- A deterministic negotiation policy resolves disagreement.
-- The result is streamed, persisted, replayable, and exportable.
+- Reviews submitted code through Security Auditor and Performance Analyst roles.
+- Checks selected dangerous patterns locally, including SQL injection, dynamic
+  execution, unsafe deserialization, exposed credentials, and disabled TLS verification.
+- Merges local findings into model reports and prevents the model from lowering
+  the severity detected by those checks.
+- Resolves disagreement through deterministic confidence-budget rules and
+  produces `APPROVE`, `CONDITIONAL_APPROVAL`, or `REJECT`.
+- Streams review events to a browser dashboard and stores results in SQLite for replay.
+- Exports findings as SARIF 2.1.0 and approved-code import inventories as CycloneDX SBOMs.
+- Supports signed GitHub pull-request webhooks and optional API-key protection.
+- Continues with local analysis when the model provider is unavailable.
 
-This is not a replacement for CodeQL, Semgrep, or a human security review. It is
-a production-minded demonstration of how an LLM can assist those controls
-without becoming the only control.
-
-## What is working
-
-- Real Qwen inference through an OpenAI-compatible provider (OpenRouter in the
-  hosted demo)
-- Deterministic security and performance checks
-- A severity floor that prevents model downgrades of proven findings
-- Bounded retry/backoff for HTTP 429 responses
-- Deterministic offline and provider-failure fallbacks
-- Confidence-budget negotiation (`DEFEND`, `PARTIAL`, `CONCEDE`)
-- Live Server-Sent Events (SSE) transcript
-- SQLite analysis history and replay
-- SARIF 2.1.0 and CycloneDX SBOM exports
-- Signed GitHub webhook ingestion
-- Docker deployment and GitHub Actions CI
-
-## Architecture
+## How it works
 
 ```text
-Browser / GitHub webhook
-          │
-          ▼
-┌───────────────────────────────┐
-│ FastAPI                       │
-│ REST · SSE · API key · HMAC   │
-└──────────────┬────────────────┘
-               │ background job
-               ▼
-┌───────────────────────────────────────────────┐
-│ Tribunal engine                               │
-│                                               │
-│  deterministic scan ───────┐                  │
-│  security specialist ──────┼─► guardrail      │
-│  performance specialist ───┘   + negotiation  │
-│                                      │        │
-│                                      ▼        │
-│                              mediator verdict │
-└──────────────┬───────────────────────┬────────┘
-               │                       │
-               ▼                       ▼
-       SQLite history          OpenRouter / Qwen
-       replay · SARIF · SBOM    (optional)
+Browser or signed GitHub webhook
+                 │
+                 ▼
+           FastAPI gateway
+                 │
+                 ▼
+       Local checks / optional MCP tools
+                 │
+                 ▼
+   Security Auditor + Performance Analyst
+        Qwen 3.8 through OpenRouter
+                 │
+                 ▼
+      Deterministic severity guardrail
+                 │
+                 ▼
+     Negotiation policy and mediator
+                 │
+                 ▼
+     Verdict → SQLite → replay / exports
 ```
 
-Provider calls are intentionally sequential in the hosted free-tier
-configuration to avoid burst-rate failures. Local deterministic analysis still
-runs when the provider or MCP service is unavailable.
+The two specialist roles use the same configured model with different prompts.
+Provider calls run sequentially to reduce burst-rate failures. Negotiation and
+the mediator are Python policies, rather than additional model calls. Offline
+mode uses local checks for both specialist reports and skips external model
+and MCP calls.
 
-## Request lifecycle
+## Technology stack
 
-1. `POST /analyze/start` validates the code and creates a queued analysis.
-2. The tribunal gathers local/MCP evidence.
-3. Security and performance specialists produce structured reports.
-4. Deterministic findings are merged into each report and establish a severity
-   floor.
-5. If severities differ, deterministic confidence-budget negotiation runs.
-6. The mediator selects the highest negotiated risk and produces remediation.
-7. The API persists the result and streams progress to the browser.
-8. The result can be replayed or exported as SARIF/SBOM.
-
-## Safety and reliability
-
-### Deterministic guardrail
-
-The current local scanner covers representative high-signal patterns,
-including SQL injection, dynamic code execution, shell execution, unsafe
-deserialization, unsafe YAML, disabled TLS verification, secrets, and unpinned
-GitHub Actions.
-
-If deterministic evidence is more severe than the model response, the local
-severity wins and its findings are merged into the report.
-
-### Provider resilience
-
-- Up to three attempts for HTTP 429 responses with bounded exponential backoff
-- Normalization of common JSON variations before Pydantic validation
-- Deterministic fallback if authentication, transport, parsing, or model calls
-  ultimately fail
-- Per-run mode: `qwen_guarded`, `degraded_fallback`, or `offline`
-
-### API security
-
-- Optional `X-API-Key` protection through `SHIFTLEFT_API_KEY`
-- Constant-time key comparison
-- GitHub webhook HMAC-SHA256 verification
-- Configurable CORS origins and input-size limits
-- Secrets loaded from environment variables, never source control
+| Component | Technology |
+|---|---|
+| Backend | Python 3.11, FastAPI, Uvicorn |
+| Dashboard | HTML, CSS, vanilla JavaScript, Server-Sent Events |
+| Model integration | Qwen 3.8 via OpenRouter, LangChain OpenAI integration, OpenAI SDK |
+| Validation | Pydantic |
+| Local analysis | Python regular expressions and AST inspection |
+| Tool interface | MCP Python SDK over HTTP |
+| Persistence | SQLite and aiosqlite |
+| HTTP client | HTTPX |
+| Testing and CI | pytest and GitHub Actions |
+| Deployment | Docker, Docker Compose, optional Caddy HTTPS proxy |
 
 ## Quick start
 
-### 1. Install
+Use Python 3.11. Create a virtual environment and install dependencies:
 
 ```bash
 git clone https://github.com/jmy744/shiftleft-society.git
@@ -139,119 +98,177 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure
+### Run offline
+
+No model-provider key is needed:
 
 ```bash
-cp .env.example .env
+OFFLINE_MODE=true uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-For the same OpenRouter configuration used by the hosted demo:
+Open <http://localhost:8000>. Submit an unsafe SQL query:
+
+```python
+db.execute(f"SELECT * FROM users WHERE id='{uid}'")
+```
+
+The local SQL-injection check should produce `REJECT`. A simple safe snippet,
+such as `def add(a, b): return a + b`, should produce `APPROVE`.
+
+### Run with Qwen 3.8
+
+If you do not already have a `.env`, copy `.env.example` to `.env`. Replace the
+provider-key placeholder with your OpenRouter key and use:
 
 ```dotenv
-QWEN_API_KEY=sk-or-v1-your-key
 QWEN_MODEL=qwen/qwen3.8-27b:free
 QWEN_BASE_URL=https://openrouter.ai/api/v1
 OFFLINE_MODE=false
 ```
 
-Never commit `.env` or paste a real key into an issue, screenshot, source file,
-or pull request.
-
-To run without any external model:
-
-```dotenv
-OFFLINE_MODE=true
-QWEN_API_KEY=
-```
-
-### 3. Run
+Set `QWEN_API_KEY` securely in `.env` or your hosting environment, then run:
 
 ```bash
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-Open <http://localhost:8000>.
+Never commit `.env` or include real credentials in logs, screenshots, or issues.
+Without a key, the app uses deterministic reports even when `OFFLINE_MODE=false`.
 
-### Docker
+### Optional MCP scanner
+
+To supply tool evidence to model reviews, run this in a separate terminal with
+its virtual environment active:
 
 ```bash
-docker build -t shiftleft-society .
-docker run --rm -p 8000:8000 --env-file .env shiftleft-society
+python mcp_server.py
 ```
 
-## Model provider
+The default endpoint is `http://127.0.0.1:8001/mcp`. The API and MCP server are
+separate processes; starting the API does not automatically start MCP. If MCP
+is unavailable, local analysis continues. With `OFFLINE_MODE=true`, MCP is skipped.
 
-The variable names retain the `QWEN_` prefix for backward compatibility, but
-the endpoint is configurable and must support OpenAI-compatible chat
-completions.
+## Model and provider
 
-| Variable | Purpose | Hosted-demo value |
+The application's default model is **Qwen 3.8** with the OpenRouter model ID
+`qwen/qwen3.8-27b:free`. The standalone baseline and benchmark clients use the
+same model and provider settings as the application.
+
+| Variable | Purpose | Default |
 |---|---|---|
-| `QWEN_API_KEY` | Provider secret | OpenRouter key (`sk-or-v1-…`) |
-| `QWEN_MODEL` | Provider model ID | `qwen/qwen3.8-27b:free` |
-| `QWEN_BASE_URL` | OpenAI-compatible base URL | `https://openrouter.ai/api/v1` |
-| `OFFLINE_MODE` | Disable all LLM calls | `false` |
+| `QWEN_API_KEY` | OpenRouter API key | Empty; local reports without a key |
+| `QWEN_MODEL` | Model ID for both specialists and benchmark clients | `qwen/qwen3.8-27b:free` |
+| `QWEN_BASE_URL` | OpenAI-compatible provider endpoint | `https://openrouter.ai/api/v1` |
+| `OFFLINE_MODE` | Skip external model and MCP calls | `false` |
 
-`GET /health` reports configuration, not a verified provider connection. A
-completed run is authoritative: `qwen_guarded` means both specialist responses
-were used; `degraded_fallback` means at least one specialist fell back locally.
+Environment overrides remain supported for compatible providers. Model-route
+availability and rate limits are controlled by the provider.
 
-## API
+`GET /health` reports the configured model and whether model calls are enabled;
+it does not verify provider connectivity. Check a completed analysis for its
+actual mode:
+
+- `qwen_guarded`: both specialist reports came from the model and passed through guardrails.
+- `degraded_fallback`: at least one specialist used a local fallback after a provider failure.
+- `offline`: both specialists used local reports.
+
+HTTP 429 responses receive bounded retries. Authentication, transport, or
+response-parsing failures fall back to local reports.
+
+## API and security
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/health` | Service and provider-configuration status |
-| `POST` | `/analyze/start` | Queue a new analysis |
-| `GET` | `/analyze/stream/{run_id}` | Stream live SSE events |
-| `GET` | `/analyses` | List analysis history |
-| `GET` | `/analyses/{run_id}/replay` | Replay the transcript |
-| `GET` | `/analyses/{run_id}/sarif` | Download SARIF 2.1.0 |
-| `GET` | `/analyses/{run_id}/sbom` | Download CycloneDX SBOM |
+| `GET` | `/health` | Service status and configured model |
+| `POST` | `/analyze/start` | Queue a code review |
+| `GET` | `/analyze/stream/{run_id}` | Consume review events over SSE |
+| `GET` | `/analyses` | List review history |
+| `GET` | `/analyses/{run_id}` | Read review status and summary |
+| `GET` | `/analyses/{run_id}/replay` | Replay the stored transcript |
+| `GET` | `/analyses/{run_id}/sarif` | Export SARIF findings |
+| `GET` | `/analyses/{run_id}/sbom` | Export the SBOM when available |
+| `GET` | `/stats` | Aggregate review statistics |
 | `POST` | `/webhook/github` | Receive signed GitHub PR events |
 
-When `SHIFTLEFT_API_KEY` is configured, send it as `X-API-Key` to protected
-endpoints.
+Set `SHIFTLEFT_API_KEY` to protect review/history endpoints; API callers must
+then send it as `X-API-Key`. GitHub webhook requests require a valid HMAC-SHA256
+signature using `GITHUB_WEBHOOK_SECRET`. PR-diff fetching uses `GITHUB_TOKEN`
+when supplied. CORS origins, input limits, and concurrency are configurable
+through environment variables in `.env.example`.
 
-## Testing
+## Testing and benchmarks
 
 ```bash
-python -m compileall -q .
+pip install pytest
 OFFLINE_MODE=true pytest -q
-docker build -t shiftleft-society:test .
+python -m compileall -q .
 ```
 
-Offline tests are deterministic and do not consume provider tokens.
+The offline integration suite covers analysis completion, streaming,
+persistence, replay, SARIF/SBOM exports, statistics, webhook signatures, and
+negotiation. It does not establish live provider availability or detection
+accuracy across real repositories.
 
-## Cost reporting
+To run the 40-case comparison with a model key configured and
+`OFFLINE_MODE=false`:
 
-The dashboard displays a local estimate based on the configured model name. It
-is useful for comparing runs, but it is **not an invoice**. Provider activity
-and billing dashboards are the source of truth. Model identifiers ending in
-`:free` are estimated at `$0.00` locally.
+```bash
+python benchmark.py
+```
+
+The baseline uses one model response; the tribunal adds specialist roles,
+checks, and negotiation. This command makes provider calls and overwrites
+`benchmark_results.json`. Newly generated results record the configured model.
+The existing results file is historical and lacks model metadata; it should
+not be presented as a verified result for the current default model.
+
+See [TESTING.md](TESTING.md) for API and Docker smoke-test instructions.
+
+## Docker deployment
+
+```bash
+docker build -t shiftleft-society .
+docker run --rm -p 8000:8000 -e OFFLINE_MODE=true shiftleft-society
+```
+
+For the Compose app and MCP service, configure `.env` first, then run:
+
+```bash
+docker compose up --build -d
+```
+
+Compose retains SQLite data in the `shiftleft-data` volume. The optional
+`production` profile adds Caddy; set `DOMAIN` and the appropriate CORS origins
+before using it for HTTPS deployment.
+
+## Cost estimates and limitations
+
+- Free model routes have a local cost estimate of `$0.00`. Provider billing is authoritative.
+- For a paid model override, set `QWEN_INPUT_PRICE_PER_MILLION` and
+  `QWEN_OUTPUT_PRICE_PER_MILLION` in USD. Both default to zero; no paid-model
+  pricing is inferred automatically.
+- Pattern and AST checks cover selected cases and can miss vulnerabilities or flag safe code.
+- An approval means the configured review policy passed; it is not proof that code is secure.
+- Generated SBOMs infer components from source imports and omit resolved versions and transitive dependencies.
+- SQLite history needs persistent storage to survive instance replacement.
+- Model-provider failures and rate limits can reduce reviews to deterministic fallbacks.
 
 ## Repository map
 
 ```text
-api.py                    FastAPI gateway, jobs, SSE, webhook, exports
-tribunal.py               specialists, scanners, guardrails, negotiation
-database.py               async SQLite schema and repository
-settings.py               environment-driven configuration
-mcp_server.py             optional MCP analysis tools
-sarif_export.py            SARIF 2.1.0 conversion
-index.html                dashboard and live tribunal theatre
-tests/test_system.py       offline integration tests
-.github/workflows/ci.yml  compile, test, and Docker checks
+api.py                    HTTP API, jobs, SSE, webhook, and exports
+tribunal.py               Specialists, local checks, guardrails, and decision policy
+database.py               Async SQLite storage and schema initialization
+settings.py               Shared model, provider, and application configuration
+mcp_server.py             Optional HTTP MCP scanner tools
+cost_tracker.py           Token accounting and configurable cost estimates
+sarif_export.py           SARIF conversion
+index.html                Dashboard and review transcript
+baseline.py               Standalone single-response model reviewer
+benchmark.py              Curated baseline-versus-tribunal comparison
+tests/test_system.py      Offline integration tests
+.github/workflows/ci.yml   Compilation, tests, and Docker build checks
 ```
-
-## Known limitations
-
-- Pattern checks are intentionally focused and do not replace full static or
-  data-flow analysis.
-- Free provider routes may be slower or rate-limited.
-- SQLite requires a persistent disk in production if history must survive
-  instance replacement.
-- Cost figures are estimates.
-- SBOM components are inferred from source imports, not a package lockfile.
 
 ## License
 
