@@ -175,9 +175,8 @@ async def llm_report(role: str, code: str, filename: str, issue: str, evidence: 
               "Do not use markdown fences or add text outside the JSON object.")
     try:
         # Use an ordinary OpenAI-compatible chat completion instead of
-        # provider-specific structured-output APIs. DashScope's compatibility
-        # endpoint supports chat completions consistently, while JSON-schema
-        # response formats vary by model and SDK version.
+        # provider-specific structured-output APIs. OpenAI-compatible
+        # providers vary in their support for JSON-schema response formats.
         response = None
         for attempt in range(3):
             try:

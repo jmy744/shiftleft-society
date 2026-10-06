@@ -25,7 +25,8 @@ def system(tmp_path, monkeypatch):
 
 
 def test_complete_analysis_and_exports(system):
-    client, _, _, _ = system
+    client, api, _, _ = system
+    assert client.get("/health").json()["model"] == api.settings.qwen_model
     start = client.post("/analyze/start", json={
         "filename": "users.py", "issue_description": "Secure lookup",
         "code": "db.execute(f\"SELECT * FROM users WHERE id='{uid}'\")",
